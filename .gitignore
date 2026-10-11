@@ -1,0 +1,70 @@
+# Local Python environments and generated caches
+.venv/
+venv/
+.runtime/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+target/
+
+# Local credentials; only the sanitized configuration template is shared
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Business data, generated databases and model weights
+/data/
+/赛事方数据/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.xlsx
+*.xls
+*.csv
+*.tsv
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.onnx
+
+# Local planning, reports and acceptance screenshots
+/docs/
+/study/
+/screenshots/
+/artifacts/
+/archives/
+*.docx
+*.pptx
+*.pdf
+
+# IDE, operating-system files, logs and local bundles
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.log
+*.tmp
+*.bak
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# Keep the runtime README and frontend assets eligible for tracking.
