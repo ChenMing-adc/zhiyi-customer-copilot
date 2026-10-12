@@ -13,11 +13,13 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from evaluation.cli import ROOT, load_bundle, load_jsonl
 from evaluation.scoring import evaluate
 from evaluation.workflow import Reviews, Runs, PROMPT, PROMPT_VERSION, LABEL_POLICY, POLICY_VERSION, outbound, valid_gold
+from evaluation.prompts import PromptLibrary
 
 
 def create_app(data_root=None, client_factory=None):
     root = Path(data_root or ROOT / 'data/evaluation').resolve()
     reviews, runner = Reviews(root), Runs(root, client_factory)
+    prompts = PromptLibrary(root)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -115,6 +117,21 @@ def create_app(data_root=None, client_factory=None):
             and refs[s['sample_id']].get('annotation_version')
             for s in samples) and all(result['pending_gold'].get(k) == 0 for k in manifest['labels']) else 'exploratory'
         return result
+
+    @app.get('/api/prompts')
+    def prompt_versions():
+        return {'entries': prompts.entries(), 'default_id': 'builtin:' + PROMPT_VERSION}
+
+    @app.post('/api/prompts')
+    async def save_prompt(request: Request):
+        content = await request.body()
+        if len(content) > 50000:
+            raise HTTPException(413, 'Prompt 文件过大')
+        try:
+            data = json.loads(content)
+            return prompts.save(data.get('version'), data.get('prompt'))
+        except (ValueError, AttributeError) as exc:
+            raise HTTPException(422, str(exc))
 
     @app.get('/api/datasets')
     def datasets():
@@ -295,11 +312,17 @@ def create_app(data_root=None, client_factory=None):
         if data.get('selection_hash') != selection_hash(manifest, samples, settings):
             raise HTTPException(409, '请先预览所选范围；数据或模型配置变化后需重新预览')
         prompt, version = data.get('prompt', PROMPT), data.get('prompt_version', PROMPT_VERSION)
+        if data.get('prompt_id'):
+            try:
+                entry = prompts.get(data['prompt_id'])
+                prompt, version = entry['prompt'], entry['version']
+            except ValueError as exc:
+                raise HTTPException(422, str(exc))
         if not isinstance(prompt, str) or not 50 <= len(prompt) <= 8000 or not isinstance(version, str) or not 1 <= len(version) <= 100:
             raise HTTPException(422, 'Prompt 长度 50–8000 字，版本名称 1–100 字')
         if runner.active():
             raise HTTPException(409, '已有评测正在运行，请等待完成或停止')
-        rid = runner.start(manifest, samples, refs, settings, prompt, version)
+        rid = runner.start(manifest, samples, refs, settings, prompt, version, data.get('prompt_id'))
         return {'id': rid, 'count': len(samples)}
 
     @app.post('/api/stop/{run_id}')

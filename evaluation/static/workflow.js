@@ -43,7 +43,6 @@ async function previewBatch(){
  if(ticket!==previewEpoch)return;
  batchPreview={...selection,selection_hash:d.selection_hash};
  $('baseline-summary').textContent=`${d.host} · ${d.model} · ${d.count} 条 · 已确认 ${d.reviewed} 条；保持现有 .env 参数。`;
- if(!$('prompt-text').value){$('prompt-text').value=d.prompt;$('prompt-version').value=d.prompt_version;}
  batchInputs=d.samples;$('outbound-preview').textContent=JSON.stringify(d.samples.slice(0,10),null,2);
  $('baseline-start').textContent=`开始 ${d.count} 条评测`;
  $('baseline-status').textContent='';
@@ -69,15 +68,16 @@ $('batch-current').onclick=()=>{batchSelected=new Set((batchCatalog.find(g=>g.id
 $('baseline-open').onclick=async()=>{
  if(demo){notice('请先返回真实数据。');return;}
  baselineKey=$('dataset').value;baselineSplit=$('split').value;
- batchCatalog=[];batchSelected.clear();$('batch-search').value='';$('prompt-text').value='';$('baseline-summary').textContent='请选择会话或截点';
+ batchCatalog=[];batchSelected.clear();$('batch-search').value='';$('baseline-summary').textContent='请选择会话或截点';
  invalidateBatch();renderBatch();$('baseline-dialog').showModal();
- try{const d=await api(`/api/baseline/catalog/${encodeURIComponent(baselineKey)}?${new URLSearchParams({split:baselineSplit})}`);batchCatalog=d.groups;batchActive=activeConversation;renderBatch();}catch(e){$('baseline-status').textContent=e.message;}
+ try{await loadPromptLibrary();const d=await api(`/api/baseline/catalog/${encodeURIComponent(baselineKey)}?${new URLSearchParams({split:baselineSplit})}`);batchCatalog=d.groups;batchActive=activeConversation;renderBatch();}catch(e){$('baseline-status').textContent=e.message;}
 };
 $('baseline-start').onclick=async()=>{
+ if(promptEditing||!$('prompt-select').value){$('baseline-status').textContent='请先保存自定义版本或选择已有版本。';return;}
  if(!batchPreview||!$('scope-confirm').checked){$('baseline-status').textContent='请预览范围并勾选调用确认。';return;}
  $('baseline-start').disabled=true;
  try{
- const d=await post(`/api/baseline/${encodeURIComponent(baselineKey)}`,{...batchPreview,prompt:$('prompt-text').value,prompt_version:$('prompt-version').value});
+ const d=await post(`/api/baseline/${encodeURIComponent(baselineKey)}`,{...batchPreview,prompt_id:$('prompt-select').value});
  $('split').value=baselineSplit;$('search').value='';$('errors').checked=false;
  $('run').innerHTML=`<option value="${d.id}">运行中</option>`;$('run').value=d.id;
  $('baseline-dialog').close();await load();
@@ -130,3 +130,37 @@ $('merge-apply').onclick=async()=>{
 };
 
 $('outbound-download').onclick=()=>{if(!batchPreview)return;const url=URL.createObjectURL(new Blob([JSON.stringify(batchInputs,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=url;a.download=baselineKey+'-outbound-preview.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+
+let promptEntries=[],promptEditing=false,promptPrevious='';
+const promptSources={builtin:'内置',history:'历史运行',custom:'自定义'};
+async function loadPromptLibrary(preferred=''){
+ const d=await api('/api/prompts');promptEntries=d.entries;
+ const chosen=preferred||$('prompt-select').value||d.default_id;
+ $('prompt-select').innerHTML=promptEntries.map(e=>`<option value="${esc(e.id)}">${esc(e.version)} · ${promptSources[e.source]||esc(e.source)} · ${e.sha256.slice(0,8)}</option>`).join('');
+ $('prompt-select').value=promptEntries.some(e=>e.id===chosen)?chosen:d.default_id;
+ usePromptVersion();
+}
+function usePromptVersion(){
+ const entry=promptEntries.find(e=>e.id===$('prompt-select').value);if(!entry)return;
+ promptEditing=false;promptPrevious=entry.id;
+ $('prompt-select').disabled=false;$('prompt-text').readOnly=true;$('prompt-text').value=entry.prompt;
+ $('prompt-version').value=entry.version;$('prompt-name-field').hidden=true;$('prompt-save').hidden=true;$('prompt-cancel').hidden=true;
+ $('prompt-info').textContent=`${promptSources[entry.source]}版本 · 已保存 · ${entry.sha256.slice(0,12)}`;
+ $('prompt-status').textContent='';
+}
+function editPrompt(blank){
+ if(!promptEntries.length)return;
+ promptEditing=true;$('prompt-select').disabled=true;$('prompt-text').readOnly=false;
+ $('prompt-name-field').hidden=false;$('prompt-save').hidden=false;$('prompt-cancel').hidden=false;
+ $('prompt-version').value='';if(blank)$('prompt-text').value='';
+ $('prompt-info').textContent='正在编辑新版本：保存后才可运行，原版本保持不变。';$('prompt-status').textContent='';$('prompt-version').focus();
+}
+$('prompt-select').onchange=usePromptVersion;
+$('prompt-copy').onclick=()=>editPrompt(false);
+$('prompt-new').onclick=()=>editPrompt(true);
+$('prompt-cancel').onclick=()=>{$('prompt-select').value=promptPrevious;usePromptVersion();};
+$('prompt-save').onclick=async()=>{
+ $('prompt-save').disabled=true;
+ try{const d=await post('/api/prompts',{version:$('prompt-version').value,prompt:$('prompt-text').value});await loadPromptLibrary(d.id);$('prompt-status').textContent='新版本已保存到本地，下次打开仍可选择。';}
+ catch(e){$('prompt-status').textContent=e.message;}finally{$('prompt-save').disabled=false;}
+};

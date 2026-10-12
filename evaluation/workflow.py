@@ -161,10 +161,10 @@ class Runs:
     def active(self):
         return any(not t.done() for t in self.tasks.values())
 
-    def start(self, manifest, samples, refs, settings, prompt, version):
+    def start(self, manifest, samples, refs, settings, prompt, version, prompt_id=None):
         rid = uuid4().hex
         data = {'dataset_id': manifest['dataset_id'], 'split': samples[0]['split'], 'run_id': manifest['source'] + ' · ' + now(),
-                'prompt_version': version, 'prompt': prompt, 'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest(),
+                'prompt_version': version, 'prompt_id': prompt_id, 'prompt': prompt, 'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest(),
                 'mode': 'isolated_classifier', 'model': settings.openai_model if settings.ai_provider == 'openai' else settings.ollama_model,
                 'policy_version': POLICY_VERSION,
                 'provider': settings.ai_provider, 'temperature': settings.ai_temperature, 'max_tokens': settings.ai_max_tokens,

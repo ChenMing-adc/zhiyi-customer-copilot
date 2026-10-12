@@ -7,3 +7,5 @@
 @media(max-width:1250px){.sample-layout{grid-template-columns:220px minmax(0,1fr)}.conversation-list{grid-column:1/-1;border-right:0;border-bottom:1px solid var(--line)}#conversations{display:flex;max-height:145px;overflow:auto}.conversation{min-width:175px;max-width:175px;border-right:1px solid var(--line)}.conversation-list .list-title small{display:inline;margin-left:10px}}@media(max-width:760px){.sample-layout{display:block}.batch-picker{grid-template-columns:145px minmax(0,1fr)}.detail-actions{top:0}.sample-list{max-height:380px;overflow:auto}}
 
 #conversations{position:relative}
+
+[hidden]{display:none!important}.prompt-editor{border:1px solid var(--line);border-radius:10px;padding:16px;margin:18px 0}.prompt-editor h3{margin:0;font-size:14px}.prompt-editor small{color:var(--muted);line-height:1.7}.prompt-editor textarea[readonly]{background:#f6f7fb;color:#46516a}#prompt-status{white-space:pre-wrap;color:var(--purple)}

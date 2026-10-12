@@ -99,3 +99,13 @@ python -m unittest discover -s tests -v
 ```
 
 真实数据、标注、分组、预测、报告均位于已忽略的 `data/` 中。此 README 仅是工具必要使用说明；不包含业务样本或标准答案。后续真实模型运行器、Prompt 版本和自动对比另行实现，本轮没有修改线上 Prompt 或 `.env`。
+
+## Prompt 版本与评测范围
+
+运行窗口打开即加载版本列表，与样本预览解耦。可选择内置版本、已有运行记录中的历史 Prompt 或本地自定义版本。选择已存版本时只读；点击“复制为自定义版本”或“新建空白版本”，填写新名称和正文后保存。名称不能重复，旧版本不覆盖。运行按所选版本 ID 从服务端读取，不使用前端伪造的同名正文。
+
+内置默认仍来自 `evaluation/workflow.py` 的 `PROMPT`/`PROMPT_VERSION`；历史版本读取 `data/evaluation/ui-runs/*.json` 的运行快照；自定义版本写入被 Git 忽略的 `data/evaluation/prompts/library.json`。每次运行另外保存版本 ID、名称、正文、SHA256，以及数据集标签枚举。库为本机持久化，不自动跨电脑同步。
+
+当前模式为独立的 `isolated_classifier`，一次调用输入两个消息：system 为所选 Prompt 加该数据集标签枚举，user 为目标消息 ID、当前截点可见消息和必要事实 JSON。不发送人工 gold 或未来消息。输出 JSON 包括 emotion、intent、risk、draft；CSDS 只计分情绪/意图，官方数据可计分情绪/意图/两类风险候选。回复草稿仅展示和检查结构，未自动评分。
+
+产品 `app/copilot/analysis.py` 中 SituationAnalyst（情境分析）、ReplyPlanner（推荐回复）和 BoundedRepair（有限修正）的 Prompt 尚未接入本评测运行器；页面改动不会更新产品节点。不能将此处得分作为这些产品节点的完整验收结果。

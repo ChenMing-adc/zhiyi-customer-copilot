@@ -77,6 +77,26 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             plan_merge(remote, self.manifest, self.samples, package)
 
+    def test_prompt_library_persists_versions_and_recovers_history(self):
+        from evaluation.prompts import PromptLibrary
+        library = PromptLibrary(self.root)
+        builtin = library.entries()[0]
+        self.assertTrue(builtin['prompt'])
+        entry = library.save('team-v1', PROMPT + '\n保持客服语气。')
+        self.assertEqual(PromptLibrary(self.root).get(entry['id'])['prompt'], entry['prompt'])
+        with self.assertRaises(ValueError):
+            library.save('TEAM-v1', PROMPT)
+        with self.assertRaises(ValueError):
+            library.save('empty', '')
+        path = self.root / 'ui-runs'
+        path.mkdir()
+        (path / 'old.json').write_text(json.dumps({'mode': 'isolated_classifier', 'prompt_version': 'old-v1', 'prompt': PROMPT + 'old'}), encoding='utf-8')
+        self.assertEqual(len(library.entries()), 3)
+        with TestClient(create_app(self.root)) as c:
+            self.assertEqual(len(c.get('/api/prompts').json()['entries']), 3)
+            self.assertEqual(c.post('/api/prompts', json={'version': 'new-v2', 'prompt': PROMPT}).status_code, 200)
+            self.assertEqual(c.post('/api/prompts', json={'version': 'new-v2', 'prompt': PROMPT}).status_code, 422)
+
     def test_outbound_has_no_gold_and_opaque_ids(self):
         value = outbound(self.samples[0])
         self.assertNotIn('gold', value)
@@ -118,7 +138,12 @@ class WorkflowTests(unittest.TestCase):
         with patch('app.core.config.get_settings', return_value=settings), TestClient(create_app(self.root, lambda _: Client())) as c:
             self.assertEqual(c.post('/api/baseline/fixture', json={}).status_code, 409)
             preview = c.get('/api/baseline/preview/fixture').json()
-            rid = c.post('/api/baseline/fixture', json={'selection_hash': preview['selection_hash']}).json()['id']
+            entry = c.post('/api/prompts', json={'version': 'frozen-test', 'prompt': PROMPT}).json()
+            rid = c.post('/api/baseline/fixture', json={'selection_hash': preview['selection_hash'], 'prompt_id': entry['id'], 'prompt': 'must ignore', 'prompt_version': 'must ignore'}).json()['id']
+            saved = json.loads((self.root / 'ui-runs' / (rid + '.json')).read_text(encoding='utf-8'))
+            self.assertEqual(saved['prompt_version'], 'frozen-test')
+            self.assertEqual(saved['prompt'], PROMPT)
+            self.assertEqual(saved['prompt_id'], entry['id'])
             # In-process fake stream finishes without awaits after response dispatch.
             view = c.get('/api/view/fixture', params={'run_id': rid}).json()
             self.assertEqual(view['run']['status'], 'completed')
