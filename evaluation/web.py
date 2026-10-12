@@ -110,8 +110,8 @@ def create_app(data_root=None, client_factory=None):
                              'tokens': sum(p['total_tokens'] for p in run['predictions'] if type(p.get('total_tokens')) is int and p['total_tokens'] >= 0),
                              'token_measurements': sum(type(p.get('total_tokens')) is int and p['total_tokens'] >= 0 for p in run['predictions'])}
         result['quality'] = 'human_reviewed' if samples and all(
-            refs[s['sample_id']].get('review_status') == 'adjudicated'
-            and len(set(refs[s['sample_id']].get('reviewers', []))) >= 2
+            refs[s['sample_id']].get('review_status') in {'confirmed', 'adjudicated'}
+            and len(set(refs[s['sample_id']].get('reviewers', []))) >= 1
             and refs[s['sample_id']].get('annotation_version')
             for s in samples) and all(result['pending_gold'].get(k) == 0 for k in manifest['labels']) else 'exploratory'
         return result
@@ -168,7 +168,7 @@ def create_app(data_root=None, client_factory=None):
                 'metrics': metrics, 'runs': runs, 'rows': rows[(page - 1) * 30:page * 30], 'total': len(rows), 'page': page,
                 'run': {k: run.get(k) for k in ['run_id', 'prompt_version', 'status', 'mode', 'model', 'started_at']} if run else None,
                 'counts': {'samples': len(selected), 'conversations': len({s['conversation_id'] for s in selected}),
-                           'reviewed': sum(refs[s['sample_id']].get('review_status') == 'adjudicated' and len(set(refs[s['sample_id']].get('reviewers', []))) >= 2 for s in selected)}}
+                           'reviewed': sum(refs[s['sample_id']].get('review_status') in {'confirmed', 'adjudicated'} and len(set(refs[s['sample_id']].get('reviewers', []))) >= 1 for s in selected)}}
 
     @app.get('/api/sample/{key}')
     def sample(key: str, sample_id: str, split: str = 'dev', run_id: str = ''):
@@ -190,44 +190,79 @@ def create_app(data_root=None, client_factory=None):
         item = next((s for s in samples if s['sample_id'] == data.get('sample_id')), None)
         if not item:
             raise HTTPException(404, '样本不存在')
-        if item['split'] == 'test':
-            raise HTTPException(403, '测试集锁定，请在独立盲审流程完成标注')
         try:
             return reviews.save(manifest, item, data)
         except ValueError as exc:
             raise HTTPException(409 if '冲突' in str(exc) else 422, str(exc))
 
-    def smoke_samples(key):
+    @app.get('/api/annotations/export/{key}')
+    def export_annotations(key: str):
+        from evaluation.sync import export_package
+        manifest, _, _ = bundle(key)
+        return export_package(reviews, manifest)
+
+    @app.post('/api/annotations/{action}/{key}')
+    async def import_annotations(action: str, key: str, request: Request):
+        from evaluation.sync import plan_merge, apply_merge
+        if action not in {'preview', 'merge'}:
+            raise HTTPException(404, '未知操作')
+        content = bytearray()
+        async for chunk in request.stream():
+            content.extend(chunk)
+            if len(content) > 20 * 1024 * 1024:
+                raise HTTPException(413, '标注包超过 20 MB')
+        try:
+            data = json.loads(content)
+            manifest, samples, _ = bundle(key)
+            if action == 'preview':
+                return plan_merge(reviews, manifest, samples, data['package'])
+            return apply_merge(reviews, manifest, samples, data['package'], data.get('token'), data.get('choices', {}))
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise HTTPException(422, str(exc))
+
+    def selected_samples(key, split, conversation='', limit=0):
         manifest, samples, refs = bundle(key)
-        if manifest['source'] != 'official_mock_replay':
-            raise HTTPException(403, '当前外发授权仅覆盖官方 S00053；CSDS 可先在本地复核')
-        selected = [s for s in samples if s['conversation_id'] == 'S00053' and s['split'] == 'dev']
-        if not selected or len(selected) > 10:
-            raise HTTPException(422, '授权范围内样本异常')
+        if manifest['source'] not in {'official_mock_replay', 'csds_local_annotations'}:
+            raise HTTPException(403, '不支持此数据来源')
+        if split not in {'dev', 'validation', 'test'} or type(limit) is not int or limit < 0:
+            raise HTTPException(422, '分组或数量无效')
+        selected = [s for s in samples if s['split'] == split and (not conversation or s['conversation_id'] == conversation)]
+        if limit:
+            selected = selected[:limit]
+        if not selected:
+            raise HTTPException(422, '所选范围没有样本')
         return manifest, selected, refs
 
+    def selection_hash(manifest, samples, settings):
+        import hashlib
+        return hashlib.sha256(json.dumps({'dataset': manifest['dataset_id'],
+            'inputs': [{'id': s['sample_id'], 'input': outbound(s)} for s in samples],
+            'destination': settings.openai_base_url, 'model': settings.openai_model},
+            sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
     @app.get('/api/baseline/preview/{key}')
-    def preview(key: str):
+    def preview(key: str, split: str = 'dev', conversation: str = '', limit: int = 0):
         from app.core.config import get_settings
         from urllib.parse import urlsplit
-        manifest, samples, refs = smoke_samples(key)
+        manifest, samples, refs = selected_samples(key, split, conversation, limit)
         settings = get_settings()
         return {'prompt': PROMPT, 'prompt_version': PROMPT_VERSION, 'count': len(samples),
+                'selection_hash': selection_hash(manifest, samples, settings),
                 'host': urlsplit(settings.openai_base_url).hostname, 'model': settings.openai_model,
                 'samples': [{'sample_id': s['sample_id'], 'input': outbound(s)} for s in samples],
-                'reviewed': sum(refs[s['sample_id']].get('review_status') == 'adjudicated' for s in samples)}
+                'reviewed': sum(refs[s['sample_id']].get('review_status') in {'confirmed', 'adjudicated'} for s in samples)}
 
     @app.post('/api/baseline/{key}')
     async def baseline(key: str, request: Request):
         from app.core.config import get_settings
         from urllib.parse import urlsplit
-        manifest, samples, refs = smoke_samples(key)
         data = await request.json()
-        if data.get('confirmed_scope') != 'official:S00053':
-            raise HTTPException(422, '请确认 S00053 外发范围')
+        manifest, samples, refs = selected_samples(key, data.get('split', 'dev'), data.get('conversation', ''), data.get('limit', 0))
         settings = get_settings()
         if settings.ai_provider != 'openai' or urlsplit(settings.openai_base_url).hostname != 'ws-k0ry66e5zn5pf7wy.cn-beijing.maas.aliyuncs.com' or settings.openai_model != 'qwen3.8-flash':
             raise HTTPException(403, '模型目的地已变化，需要重新确认外发授权')
+        if data.get('selection_hash') != selection_hash(manifest, samples, settings):
+            raise HTTPException(409, '请先预览所选范围；数据或模型配置变化后需重新预览')
         prompt, version = data.get('prompt', PROMPT), data.get('prompt_version', PROMPT_VERSION)
         if not isinstance(prompt, str) or not 50 <= len(prompt) <= 8000 or not isinstance(version, str) or not 1 <= len(version) <= 100:
             raise HTTPException(422, 'Prompt 长度 50–8000 字，版本名称 1–100 字')

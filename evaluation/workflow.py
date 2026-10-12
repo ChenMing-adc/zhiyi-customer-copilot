@@ -84,26 +84,11 @@ class Reviews:
             raise ValueError('填写简短标注理由（不超过 1000 字）')
         vote = {'reviewer': reviewer, 'gold': payload['gold'], 'evidence_ids': evidence, 'note': note,
                 'at': now(), 'policy_version': POLICY_VERSION}
-        action = payload.get('action', 'vote')
-        if action not in {'vote', 'adjudicate'}:
-            raise ValueError('未知复核动作')
-        votes = item['votes']
-        if action == 'adjudicate':
-            if len(votes) < 2 or reviewer in votes or item['resolved'].get('review_status') != 'conflict':
-                raise ValueError('仅允许第三位复核人仲裁已有双人分歧')
-            chosen, status = vote, 'adjudicated'
-        else:
-            votes[reviewer] = vote
-            values = list(votes.values())
-            # Risk order is not semantically significant.
-            normalized = [json.dumps({k: sorted(v) if isinstance(v, list) else v for k, v in x['gold'].items()}, sort_keys=True) for x in values]
-            status = 'reviewing' if len(values) < 2 else 'adjudicated' if len(set(normalized)) == 1 else 'conflict'
-            chosen = vote
         item['revision'] += 1
-        item['history'].append({**vote, 'action': action, 'revision': item['revision']})
-        item['resolved'] = {'gold': chosen['gold'], 'evidence_ids': chosen['evidence_ids'],
-                            'review_status': status, 'reviewers': sorted(set(votes) | {reviewer}),
-                            'annotation_version': f"review-{item['revision']}", 'note': chosen['note']}
+        item['history'].append({**vote, 'action': 'save', 'revision': item['revision']})
+        item['resolved'] = {'gold': vote['gold'], 'evidence_ids': vote['evidence_ids'],
+                            'review_status': 'confirmed', 'reviewers': [reviewer],
+                            'annotation_version': f"review-{item['revision']}", 'note': vote['note']}
         item['resolved']['policy_version'] = POLICY_VERSION
         data[sid] = item
         atomic_json(self.path(manifest['dataset_id']), data)
@@ -178,14 +163,14 @@ class Runs:
 
     def start(self, manifest, samples, refs, settings, prompt, version):
         rid = uuid4().hex
-        data = {'dataset_id': manifest['dataset_id'], 'split': 'dev', 'run_id': 'S00053 · ' + now(),
+        data = {'dataset_id': manifest['dataset_id'], 'split': samples[0]['split'], 'run_id': manifest['source'] + ' · ' + now(),
                 'prompt_version': version, 'prompt': prompt, 'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest(),
                 'mode': 'isolated_classifier', 'model': settings.openai_model if settings.ai_provider == 'openai' else settings.ollama_model,
                 'policy_version': POLICY_VERSION,
                 'provider': settings.ai_provider, 'temperature': settings.ai_temperature, 'max_tokens': settings.ai_max_tokens,
                 'sample_ids': [s['sample_id'] for s in samples], 'references': [refs[s['sample_id']] for s in samples],
                 'predictions': [], 'status': 'running', 'started_at': now(),
-                'authorization_scope': 'official S00053 only', 'labels': manifest['labels']}
+                'authorization_scope': 'CSDS and official datasets; user authorized 2026-10-12', 'labels': manifest['labels']}
         atomic_json(self.path(rid), data)
         self.tasks[rid] = asyncio.create_task(self.execute(rid, data, samples, settings))
         return rid

@@ -34,28 +34,48 @@ class WorkflowTests(unittest.TestCase):
                 'gold': {'emotion': emotion, 'intent': 'refund'}, 'evidence_ids': ['S00053:1'],
                 'note': '人工测试标注依据', 'action': action}
 
-    def test_review_conflict_requires_third_person_and_preserves_original(self):
+    def test_single_author_save_is_confirmed_and_preserves_original(self):
         before = (self.root / 'fixture/annotations.jsonl').read_bytes()
         with TestClient(create_app(self.root)) as c:
-            self.assertEqual(c.post('/api/review/fixture', json=self.vote('A', 0)).json()['resolved']['review_status'], 'reviewing')
-            self.assertEqual(c.post('/api/review/fixture', json=self.vote('B', 1, 'anger')).json()['resolved']['review_status'], 'conflict')
-            self.assertEqual(c.post('/api/review/fixture', json=self.vote('A', 2, action='adjudicate')).status_code, 422)
-            r = c.post('/api/review/fixture', json=self.vote('C', 2, action='adjudicate')).json()
-            self.assertEqual(r['resolved']['review_status'], 'adjudicated')
-            self.assertEqual(len(r['history']), 3)
+            r = c.post('/api/review/fixture', json=self.vote('A', 0)).json()
+            self.assertEqual(r['resolved']['review_status'], 'confirmed')
+            self.assertEqual(r['resolved']['reviewers'], ['A'])
+            r = c.post('/api/review/fixture', json=self.vote('A', 1, 'anger')).json()
+            self.assertEqual(r['resolved']['gold']['emotion'], 'anger')
+            self.assertEqual(len(r['history']), 2)
             self.assertEqual(c.post('/api/review/fixture', json=self.vote('A', 0)).status_code, 409)
         self.assertEqual(before, (self.root / 'fixture/annotations.jsonl').read_bytes())
 
-    def test_repeat_same_person_does_not_pass_and_invalid_evidence_rejected(self):
-        r = self.reviews.save(self.manifest, self.samples[0], self.vote('A', 0))
-        r = self.reviews.save(self.manifest, self.samples[0], self.vote('A', 1))
-        self.assertEqual(r['resolved']['review_status'], 'reviewing')
-        invalid = self.vote('B', 2)
+    def test_invalid_evidence_rejected(self):
+        invalid = self.vote('A', 0)
         invalid['evidence_ids'] = ['future']
         with self.assertRaises(ValueError):
             self.reviews.save(self.manifest, self.samples[0], invalid)
-        r = self.reviews.save(self.manifest, self.samples[0], self.vote('B', 2))
-        self.assertEqual(r['resolved']['review_status'], 'adjudicated')
+
+    def test_annotation_transfer_conflict_and_stale_merge(self):
+        from evaluation.sync import export_package, plan_merge, apply_merge
+        self.reviews.save(self.manifest, self.samples[0], self.vote('A', 0))
+        package = export_package(self.reviews, self.manifest)
+        remote = Reviews(self.root / 'remote')
+        plan = plan_merge(remote, self.manifest, self.samples, package)
+        self.assertEqual(plan['counts']['add'], 1)
+        apply_merge(remote, self.manifest, self.samples, package, plan['token'], {})
+        self.assertEqual(plan_merge(remote, self.manifest, self.samples, package)['counts']['skip'], 1)
+        remote.save(self.manifest, self.samples[0], self.vote('B', 1, 'anger'))
+        self.reviews.save(self.manifest, self.samples[0], self.vote('A', 1, 'anxiety'))
+        package = export_package(self.reviews, self.manifest)
+        plan = plan_merge(remote, self.manifest, self.samples, package)
+        self.assertEqual(plan['counts']['conflict'], 1)
+        with self.assertRaises(ValueError):
+            apply_merge(remote, self.manifest, self.samples, package, plan['token'], {})
+        apply_merge(remote, self.manifest, self.samples, package, plan['token'], {self.samples[0]['sample_id']: 'incoming'})
+        self.assertEqual(plan_merge(remote, self.manifest, self.samples, package)['counts']['skip'], 1)
+        self.assertTrue(remote.read(self.manifest['dataset_id'])[self.samples[0]['sample_id']]['merge_history'])
+        with self.assertRaises(ValueError):
+            apply_merge(remote, self.manifest, self.samples, package, plan['token'], {})
+        package['dataset_id'] = 'wrong'
+        with self.assertRaises(ValueError):
+            plan_merge(remote, self.manifest, self.samples, package)
 
     def test_outbound_has_no_gold_and_opaque_ids(self):
         value = outbound(self.samples[0])
@@ -63,14 +83,15 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn('S00053', json.dumps(value))
         self.assertEqual(value['target_message_id'], 'M1')
 
-    def test_unauthorized_source_and_invalid_review_cannot_start_model(self):
+    def test_both_sources_open_but_require_matching_preview(self):
         other = self.root / 'csds'
         other.mkdir()
         source = [{'conversation_id': 'S00053', 'messages': [{'seq': 1, 'role': 'customer', 'text': '测试', 'emotion': 'neutral', 'intent': 'refund'}]}]
         samples, refs = csds_samples(source)
         write_bundle(other, 'csds_local_annotations', 'synthetic', CSDS_LABELS, samples, refs, grouped_split(source), 28)
         with TestClient(create_app(self.root, lambda _: self.fail('must not call model'))) as c:
-            self.assertEqual(c.post('/api/baseline/csds', json={'confirmed_scope': 'official:S00053'}).status_code, 403)
+            self.assertEqual(c.get('/api/baseline/preview/csds').status_code, 200)
+            self.assertEqual(c.post('/api/baseline/csds', json={}).status_code, 409)
             self.assertEqual(c.post('/api/baseline/fixture', content='{}', headers={'Content-Type': 'text/plain'}).status_code, 415)
             invalid = self.vote('A', 0)
             invalid['reviewer'] = 123
@@ -95,15 +116,15 @@ class WorkflowTests(unittest.TestCase):
         settings = SimpleNamespace(ai_provider='openai', openai_model='qwen3.8-flash',
                     openai_base_url='https://ws-k0ry66e5zn5pf7wy.cn-beijing.maas.aliyuncs.com/v1', ai_temperature=.35, ai_max_tokens=512)
         with patch('app.core.config.get_settings', return_value=settings), TestClient(create_app(self.root, lambda _: Client())) as c:
-            self.assertEqual(c.post('/api/baseline/fixture', json={}).status_code, 422)
-            rid = c.post('/api/baseline/fixture', json={'confirmed_scope': 'official:S00053'}).json()['id']
+            self.assertEqual(c.post('/api/baseline/fixture', json={}).status_code, 409)
+            preview = c.get('/api/baseline/preview/fixture').json()
+            rid = c.post('/api/baseline/fixture', json={'selection_hash': preview['selection_hash']}).json()['id']
             # In-process fake stream finishes without awaits after response dispatch.
             view = c.get('/api/view/fixture', params={'run_id': rid}).json()
             self.assertEqual(view['run']['status'], 'completed')
             self.assertEqual(view['counts']['samples'], 1)
             self.assertEqual(view['metrics']['received_predictions'], 1)
             c.post('/api/review/fixture', json=self.vote('A', 0, 'anger'))
-            c.post('/api/review/fixture', json=self.vote('B', 1, 'anger'))
             old = c.get('/api/view/fixture', params={'run_id': rid}).json()
             self.assertEqual(old['metrics']['tasks']['emotion']['accuracy_all_samples'], 1)
             new_id = c.post('/api/rescore/fixture', json={'run_id': rid}).json()['id']

@@ -30,11 +30,11 @@ def evaluate(references, predictions, labels, allow_unreviewed=False):
         if sid in gold_by_id:
             raise ValueError('Duplicate reference sample_id')
         reviewers = reference.get('reviewers', [])
-        reviewed = (reference.get('review_status') == 'adjudicated' and isinstance(reviewers, list)
+        reviewed = (reference.get('review_status') in {'confirmed', 'adjudicated'} and isinstance(reviewers, list)
                     and all(isinstance(r, str) and r.strip() for r in reviewers)
-                    and len(set(reviewers)) >= 2 and bool(reference.get('annotation_version')))
+                    and len(set(reviewers)) >= (2 if reference.get('review_status') == 'adjudicated' else 1) and bool(reference.get('annotation_version')))
         if not allow_unreviewed and not reviewed:
-            raise ValueError('Unreviewed gold: use adjudicated references, or explicitly select exploratory --allow-unreviewed')
+            raise ValueError('Unreviewed gold: use confirmed references, or explicitly select exploratory --allow-unreviewed')
         for task, classes in labels.items():
             value = reference.get('gold', {}).get(task)
             if task == 'risk':
