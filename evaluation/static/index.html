@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>知意 · 评测实验室</title><link rel="stylesheet" href="/styles.css"><script defer src="/app.js"></script></head>
+<body>
+<aside class="sidebar"><div class="brand"><span class="brand-icon">知</span><div>知意 <small>EVALUATION LAB</small></div></div><div class="nav-title">评测空间</div><div class="nav active">◫　数据与结果</div><div class="side-note">独立评测环境<br><span>本地数据 · 单独运行</span></div><div class="side-bottom"><i></i> 离线查看模式<p>不会调用模型<br>不改动客服工作台</p></div></aside>
+<main><header><div><div class="eyebrow">MODEL EVALUATION</div><h1>评测实验室</h1><p>从整体指标到逐条回复，查看模型表现与需要改进的地方。</p></div><button id="demo" class="secondary" disabled>查看评分示例 ↗</button></header>
+<div id="notice" role="status" hidden></div>
+<section class="controls card"><label>评测数据<select id="source"><option value="csds_local_annotations">CSDS 美妆客服</option><option value="official_mock_replay">官方业务 MOCK</option></select></label><label>数据版本<select id="dataset"></select></label><label>数据分组<select id="split"><option value="dev">开发集</option><option value="validation">验证集</option><option value="test">锁定测试集</option></select></label><label class="run-select">评测记录<select id="run"><option value="">尚未选择评测记录</option></select></label><button id="import" class="primary">＋ 导入预测结果</button><input id="file" type="file" accept=".json,application/json" hidden></section>
+<div class="subline"><span id="dataset-info">正在读取本地数据…</span><button id="template" class="link-button">下载预测格式</button></div>
+<div id="quality" class="quality">尚未运行真实模型，以下展示数据准备情况。</div>
+<section id="metrics" class="metric-grid"></section>
+<section class="card performance"><div class="section-head"><div><h2>分类表现</h2><span id="metric-note">固定标签 Macro-F1 · 失败样本保留在分母中</span></div><div class="tabs"><button data-task="emotion" class="selected">情绪</button><button data-task="intent">意图</button><button data-task="risk">风险</button></div></div><div id="performance"></div></section>
+<section class="card samples"><div class="section-head"><div><h2>样本与模型输出 <span id="total" class="count"></span></h2><span>选择一条样本，核对上下文、标准答案和原始输出</span></div><div class="filters"><input id="search" placeholder="搜索会话 ID 或当前消息" aria-label="搜索样本"><label class="checkbox"><input type="checkbox" id="errors"> 仅看需检查</label></div></div><div class="sample-layout"><div class="sample-list"><div id="rows"></div><div class="pagination"><button id="prev">← 上一页</button><span id="page"></span><button id="next">下一页 →</button></div></div><div id="detail" class="detail"><div class="empty">选择左侧样本查看详情</div></div></div></section>
+<footer>知意评测实验室 · 指标用于探索与复核，未审核标注不作为正式验收结果。</footer></main></body></html>
