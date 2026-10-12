@@ -68,6 +68,37 @@ class EvaluationWebTests(unittest.TestCase):
         self.assertEqual(metrics['tasks'], {})
         self.assertEqual(metrics['pending_gold']['emotion'], 1)
 
+    def test_grouped_navigation_and_exact_selection(self):
+        path = self.root / 'multi'
+        path.mkdir()
+        source = [{'conversation_id': cid, 'messages': [
+            {'seq': i, 'role': 'customer', 'text': f'{cid} message {i}', 'emotion': 'neutral', 'intent': 'refund'}
+            for i in range(1, count + 1)]} for cid, count in [('A', 34), ('B', 2)]]
+        samples, refs = csds_samples(source)
+        write_bundle(path, 'csds_local_annotations', 'synthetic', CSDS_LABELS, samples, refs,
+                     grouped_split(source, forced_dev=['A', 'B']), 28)
+        view = self.client.get('/api/view/multi').json()
+        self.assertEqual([(g['id'], g['count']) for g in view['groups']], [('A', 34), ('B', 2)])
+        self.assertEqual(len(view['rows']), 30)
+        self.assertTrue(all(r['conversation'] == 'A' for r in view['rows']))
+        second = self.client.get('/api/view/multi?conversation=A&page=2').json()
+        self.assertEqual([r['target_seq'] for r in second['rows']], [31, 32, 33, 34])
+        other = self.client.get('/api/view/multi?conversation=B&page=2').json()
+        self.assertEqual(other['page'], 1)
+        self.assertEqual(other['total'], 2)
+        searched = self.client.get('/api/view/multi?q=B%20message').json()
+        self.assertEqual(searched['conversation'], 'B')
+        catalog = self.client.get('/api/baseline/catalog/multi').json()
+        self.assertEqual(len(catalog['groups'][0]['samples']), 34)
+        ids = ['csds:A:34', 'csds:B:2']
+        preview = self.client.post('/api/baseline/preview/multi', json={'split': 'dev', 'sample_ids': ids}).json()
+        self.assertEqual([s['sample_id'] for s in preview['samples']], ids)
+        self.assertEqual(preview['count'], 2)
+        for invalid in [[], ['unknown'], [ids[0], ids[0]]]:
+            self.assertEqual(self.client.post('/api/baseline/preview/multi', json={'sample_ids': invalid}).status_code, 422)
+        self.assertEqual(self.client.post('/api/baseline/multi', json={'sample_ids': [ids[0]], 'selection_hash': preview['selection_hash']}).status_code, 409)
+        self.assertFalse((self.root / 'ui-runs').exists())
+
     def test_demo_is_explicit_and_creates_no_files(self):
         before = set(self.root.rglob('*'))
         demo = self.client.get('/api/demo').json()

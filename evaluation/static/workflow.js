@@ -2,11 +2,12 @@ let reviewSample=null,reviewKey='',reviewRevision=0;
 const post=(url,data)=>api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
 $('review-close').onclick=()=>$('review-dialog').close();
 $('baseline-close').onclick=()=>$('baseline-dialog').close();
-$('review-open').onclick=async()=>{
- if(demo||!selected){notice('请先在真实数据中选中一条样本。');return;}
+async function openReview(sampleId=selected){
+ if(demo||!sampleId){notice('请先在真实数据中选中一条样本。');return;}
  try{
+ selected=sampleId;await showSample(sampleId);
  reviewKey=$('dataset').value;
- const d=await api(`/api/sample/${encodeURIComponent(reviewKey)}?${new URLSearchParams({sample_id:selected,split:$('split').value})}`);
+ const d=await api(`/api/sample/${encodeURIComponent(reviewKey)}?${new URLSearchParams({sample_id:sampleId,split:$('split').value})}`);
  reviewSample=d.sample;reviewRevision=d.review.revision;
  $('review-context').innerHTML=`<p>${esc(d.label_policy)} · ${esc(d.policy_version)}</p>`+d.sample.input.messages.map(m=>`<div class="review-message"><b>${esc(m.role)}</b> ${esc(m.text)}</div>`).join('');
  $('review-labels').innerHTML=Object.entries(state.dataset.labels).map(([k,values])=>k==='risk'?`<fieldset><legend>风险候选</legend>${values.map(v=>`<label class="checkbox"><input type="checkbox" name="gold-risk" value="${esc(v)}">${esc(label(v))}</label>`).join('')}<label>风险核对<select required><option value="">请明确核对风险</option><option value="confirmed">已核对（未勾选任何候选表示无风险）</option></select></label></fieldset>`:`<label>${k==='emotion'?'当前情绪':'主要意图'}<select id="gold-${k}" required><option value="">请选择</option>${values.map(v=>`<option value="${esc(v)}">${esc(label(v))}</option>`).join('')}</select></label>`).join('');
@@ -27,17 +28,18 @@ $('review-form').onsubmit=async e=>{
  const d=await post(`/api/review/${encodeURIComponent(reviewKey)}`,{sample_id:reviewSample.sample_id,revision:reviewRevision,reviewer:$('reviewer').value,gold,note:$('review-note').value,evidence_ids:Array.from(document.querySelectorAll('[name="evidence"]:checked')).map(x=>x.value)});
  reviewRevision=d.revision;
  $('review-status').textContent=`已保存：${d.resolved.review_status} · 版本 ${d.revision}。\n`+d.history.map(h=>`${h.reviewer} · ${h.action} · ${JSON.stringify(h.gold)} · ${h.note}`).join('\n');
- // Reload counts without losing the open review form.
+ selected=reviewSample.sample_id;
  await load();
  }catch(err){$('review-status').textContent=err.message;}finally{button.disabled=false;}
 };
-let baselineKey='',baselineSplit='',batchPreview=null,previewEpoch=0,batchInputs=[];
+let baselineKey='',baselineSplit='',batchPreview=null,previewEpoch=0,batchInputs=[],batchCatalog=[],batchSelected=new Set(),batchActive='';
 async function previewBatch(){
  const ticket=++previewEpoch;
  batchPreview=null;$('baseline-start').disabled=true;$('baseline-summary').textContent='正在计算所选范围…';$('baseline-start').textContent='正在预览…';
  try{
- const selection={split:baselineSplit,conversation:$('batch-conversation').value.trim(),limit:Number($('batch-limit').value)};
- const d=await api(`/api/baseline/preview/${encodeURIComponent(baselineKey)}?${new URLSearchParams(selection)}`);
+ if(!batchSelected.size)throw Error('请至少选择一个截点');
+ const selection={split:baselineSplit,sample_ids:[...batchSelected]};
+ const d=await post(`/api/baseline/preview/${encodeURIComponent(baselineKey)}`,selection);
  if(ticket!==previewEpoch)return;
  batchPreview={...selection,selection_hash:d.selection_hash};
  $('baseline-summary').textContent=`${d.host} · ${d.model} · ${d.count} 条 · 已确认 ${d.reviewed} 条；保持现有 .env 参数。`;
@@ -48,12 +50,28 @@ async function previewBatch(){
  }catch(e){if(ticket===previewEpoch)$('baseline-status').textContent=e.message;}finally{if(ticket===previewEpoch)$('baseline-start').disabled=!batchPreview;}
 }
 $('batch-preview').onclick=previewBatch;
-for(const id of ['batch-conversation','batch-limit'])$(id).oninput=()=>{++previewEpoch;batchPreview=null;$('baseline-start').disabled=true;$('baseline-summary').textContent='正在计算所选范围…';$('baseline-start').textContent='正在预览…';$('baseline-status').textContent='范围已改变，请更新预览。';};
+function invalidateBatch(){++previewEpoch;batchPreview=null;$('baseline-start').disabled=true;$('baseline-start').textContent='先预览所选样本';$('scope-confirm').checked=false;$('baseline-status').textContent='选择已更新，请预览后运行。';$('batch-count').textContent=`已选 ${batchSelected.size} / ${batchCatalog.reduce((n,g)=>n+g.samples.length,0)} 个截点`;}
+function filteredBatch(){const q=$('batch-search').value.toLowerCase();return batchCatalog.map(g=>({...g,samples:g.samples.filter(s=>(g.id+' '+s.text).toLowerCase().includes(q))})).filter(g=>g.samples.length);}
+function renderBatch(){
+ const groups=filteredBatch();if(!groups.some(g=>g.id===batchActive))batchActive=groups[0]?.id||'';
+ $('batch-groups').innerHTML=groups.map(g=>`<div class="batch-group"><input type="checkbox" aria-label="选择会话 ${esc(g.id)}" data-group="${esc(g.id)}"><button data-batch-group="${esc(g.id)}" class="${g.id===batchActive?'chosen':''}">${esc(g.id)} <small>${g.samples.filter(s=>batchSelected.has(s.id)).length}/${g.samples.length} 个截点</small></button></div>`).join('')||'<p>没有匹配会话</p>';
+ $('batch-groups').querySelectorAll('[data-group]').forEach(el=>{const g=groups.find(g=>g.id===el.dataset.group),count=g.samples.filter(s=>batchSelected.has(s.id)).length;el.checked=count===g.samples.length;el.indeterminate=count>0&&count<g.samples.length;el.onchange=()=>{g.samples.forEach(s=>el.checked?batchSelected.add(s.id):batchSelected.delete(s.id));invalidateBatch();renderBatch();};});
+ $('batch-groups').querySelectorAll('[data-batch-group]').forEach(b=>b.onclick=()=>{batchActive=b.dataset.batchGroup;renderBatch();});
+ const group=groups.find(g=>g.id===batchActive);
+ $('batch-samples').innerHTML=group?`<b>${esc(group.id)} · 勾选需要送测的截点</b>`+group.samples.map(s=>`<label class="batch-sample"><input type="checkbox" data-sample="${esc(s.id)}" ${batchSelected.has(s.id)?'checked':''}><span><b>第 ${s.seq} 轮 · ${s.reviewed?'已标注':'待标注'}</b><small>${esc(s.text)}</small></span></label>`).join(''):'<p>选择左侧会话</p>';
+ $('batch-samples').querySelectorAll('[data-sample]').forEach(el=>el.onchange=()=>{el.checked?batchSelected.add(el.dataset.sample):batchSelected.delete(el.dataset.sample);invalidateBatch();renderBatch();});
+ $('batch-count').textContent=`已选 ${batchSelected.size} / ${batchCatalog.reduce((n,g)=>n+g.samples.length,0)} 个截点`;
+}
+$('batch-search').oninput=renderBatch;
+$('batch-all').onclick=()=>{filteredBatch().forEach(g=>g.samples.forEach(s=>batchSelected.add(s.id)));invalidateBatch();renderBatch();};
+$('batch-clear').onclick=()=>{batchSelected.clear();invalidateBatch();renderBatch();};
+$('batch-current').onclick=()=>{batchSelected=new Set((batchCatalog.find(g=>g.id===activeConversation)?.samples||[]).map(s=>s.id));batchActive=activeConversation;$('batch-search').value='';invalidateBatch();renderBatch();};
 $('baseline-open').onclick=async()=>{
  if(demo){notice('请先返回真实数据。');return;}
  baselineKey=$('dataset').value;baselineSplit=$('split').value;
- $('batch-conversation').value='';$('batch-limit').value='0';$('prompt-text').value='';
- $('scope-confirm').checked=false;$('baseline-dialog').showModal();await previewBatch();
+ batchCatalog=[];batchSelected.clear();$('batch-search').value='';$('prompt-text').value='';$('baseline-summary').textContent='请选择会话或截点';
+ invalidateBatch();renderBatch();$('baseline-dialog').showModal();
+ try{const d=await api(`/api/baseline/catalog/${encodeURIComponent(baselineKey)}?${new URLSearchParams({split:baselineSplit})}`);batchCatalog=d.groups;batchActive=activeConversation;renderBatch();}catch(e){$('baseline-status').textContent=e.message;}
 };
 $('baseline-start').onclick=async()=>{
  if(!batchPreview||!$('scope-confirm').checked){$('baseline-status').textContent='请预览范围并勾选调用确认。';return;}

@@ -130,10 +130,11 @@ def create_app(data_root=None, client_factory=None):
         return {'datasets': output, 'invalid': invalid}
 
     @app.get('/api/view/{key}')
-    def view(key: str, split: str = 'dev', run_id: str = '', q: str = '', errors_only: bool = False, page: int = 1):
+    def view(key: str, split: str = 'dev', run_id: str = '', q: str = '', errors_only: bool = False, page: int = 1, conversation: str = ''):
         if split not in {'dev', 'validation', 'test'} or page < 1 or len(q) > 200:
             raise HTTPException(422, '查询参数无效')
         manifest, all_samples, refs = bundle(key)
+        current_refs = refs
         selected = [s for s in all_samples if s['split'] == split]
         run = get_run(run_id, manifest, split) if run_id else None
         if run and run.get('sample_ids'):
@@ -161,14 +162,23 @@ def create_app(data_root=None, client_factory=None):
                 continue
             p = pred.get(s['sample_id'])
             rows.append({'id': s['sample_id'], 'conversation': s['conversation_id'], 'text': last['text'],
-                         'gold': refs[s['sample_id']]['gold'], 'prediction': {k: p.get(k) for k in ['emotion', 'intent', 'risk']} if p else None,
+                         'target_seq': s['target_seq'], 'gold': current_refs[s['sample_id']]['gold'], 'prediction': {k: p.get(k) for k in ['emotion', 'intent', 'risk']} if p else None,
                          'status': '待评测' if not run else '未返回' if not p else '调用失败' if p.get('status') != 'ok' else '需检查' if s['sample_id'] in wrong else '已返回',
-                         'review_status': refs[s['sample_id']].get('review_status')})
+                         'review_status': current_refs[s['sample_id']].get('review_status')})
+        groups = {}
+        for row in rows:
+            group = groups.setdefault(row['conversation'], {'id': row['conversation'], 'count': 0, 'reviewed': 0, 'errors': 0, 'preview': row['text']})
+            group['count'] += 1
+            group['reviewed'] += row['review_status'] in {'confirmed', 'adjudicated'}
+            group['errors'] += row['status'] in {'需检查', '调用失败', '未返回'}
+        active = conversation if conversation in groups else next(iter(groups), '')
+        rows = [r for r in rows if r['conversation'] == active]
+        page = min(page, max(1, (len(rows) + 29) // 30))
         return {'dataset': {'key': key, 'source': manifest['source'], 'labels': manifest['labels'], 'dataset_id': manifest['dataset_id']},
-                'metrics': metrics, 'runs': runs, 'rows': rows[(page - 1) * 30:page * 30], 'total': len(rows), 'page': page,
+                'groups': list(groups.values()), 'conversation': active, 'metrics': metrics, 'runs': runs, 'rows': rows[(page - 1) * 30:page * 30], 'total': len(rows), 'page': page,
                 'run': {k: run.get(k) for k in ['run_id', 'prompt_version', 'status', 'mode', 'model', 'started_at']} if run else None,
                 'counts': {'samples': len(selected), 'conversations': len({s['conversation_id'] for s in selected}),
-                           'reviewed': sum(refs[s['sample_id']].get('review_status') in {'confirmed', 'adjudicated'} and len(set(refs[s['sample_id']].get('reviewers', []))) >= 1 for s in selected)}}
+                           'reviewed': sum(current_refs[s['sample_id']].get('review_status') in {'confirmed', 'adjudicated'} and len(set(current_refs[s['sample_id']].get('reviewers', []))) >= 1 for s in selected)}}
 
     @app.get('/api/sample/{key}')
     def sample(key: str, sample_id: str, split: str = 'dev', run_id: str = ''):
@@ -220,13 +230,18 @@ def create_app(data_root=None, client_factory=None):
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             raise HTTPException(422, str(exc))
 
-    def selected_samples(key, split, conversation='', limit=0):
+    def selected_samples(key, split, conversation='', limit=0, sample_ids=None):
         manifest, samples, refs = bundle(key)
         if manifest['source'] not in {'official_mock_replay', 'csds_local_annotations'}:
             raise HTTPException(403, '不支持此数据来源')
         if split not in {'dev', 'validation', 'test'} or type(limit) is not int or limit < 0:
             raise HTTPException(422, '分组或数量无效')
         selected = [s for s in samples if s['split'] == split and (not conversation or s['conversation_id'] == conversation)]
+        if sample_ids is not None:
+            allowed = {s['sample_id'] for s in selected}
+            if not isinstance(sample_ids, list) or not sample_ids or not all(isinstance(sid, str) and sid in allowed for sid in sample_ids) or len(set(sample_ids)) != len(sample_ids):
+                raise HTTPException(422, '请选择当前分组内的不重复样本')
+            selected = [s for s in selected if s['sample_id'] in set(sample_ids)]
         if limit:
             selected = selected[:limit]
         if not selected:
@@ -241,10 +256,10 @@ def create_app(data_root=None, client_factory=None):
             sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     @app.get('/api/baseline/preview/{key}')
-    def preview(key: str, split: str = 'dev', conversation: str = '', limit: int = 0):
+    def preview(key: str, split: str = 'dev', conversation: str = '', limit: int = 0, sample_ids=None):
         from app.core.config import get_settings
         from urllib.parse import urlsplit
-        manifest, samples, refs = selected_samples(key, split, conversation, limit)
+        manifest, samples, refs = selected_samples(key, split, conversation, limit, sample_ids)
         settings = get_settings()
         return {'prompt': PROMPT, 'prompt_version': PROMPT_VERSION, 'count': len(samples),
                 'selection_hash': selection_hash(manifest, samples, settings),
@@ -252,12 +267,28 @@ def create_app(data_root=None, client_factory=None):
                 'samples': [{'sample_id': s['sample_id'], 'input': outbound(s)} for s in samples],
                 'reviewed': sum(refs[s['sample_id']].get('review_status') in {'confirmed', 'adjudicated'} for s in samples)}
 
+    @app.get('/api/baseline/catalog/{key}')
+    def selection_catalog(key: str, split: str = 'dev'):
+        _, samples, refs = selected_samples(key, split)
+        groups = {}
+        for sample in samples:
+            groups.setdefault(sample['conversation_id'], []).append({
+                'id': sample['sample_id'], 'seq': sample['target_seq'],
+                'text': sample['input']['messages'][-1]['text'][:180],
+                'reviewed': refs[sample['sample_id']].get('review_status') in {'confirmed', 'adjudicated'}})
+        return {'groups': [{'id': cid, 'samples': rows} for cid, rows in groups.items()]}
+
+    @app.post('/api/baseline/preview/{key}')
+    async def selected_preview(key: str, request: Request):
+        data = await request.json()
+        return preview(key, data.get('split', 'dev'), data.get('conversation', ''), data.get('limit', 0), data.get('sample_ids'))
+
     @app.post('/api/baseline/{key}')
     async def baseline(key: str, request: Request):
         from app.core.config import get_settings
         from urllib.parse import urlsplit
         data = await request.json()
-        manifest, samples, refs = selected_samples(key, data.get('split', 'dev'), data.get('conversation', ''), data.get('limit', 0))
+        manifest, samples, refs = selected_samples(key, data.get('split', 'dev'), data.get('conversation', ''), data.get('limit', 0), data.get('sample_ids'))
         settings = get_settings()
         if settings.ai_provider != 'openai' or urlsplit(settings.openai_base_url).hostname != 'ws-k0ry66e5zn5pf7wy.cn-beijing.maas.aliyuncs.com' or settings.openai_model != 'qwen3.8-flash':
             raise HTTPException(403, '模型目的地已变化，需要重新确认外发授权')
