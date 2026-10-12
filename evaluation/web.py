@@ -1,4 +1,6 @@
-"""Independent local evaluation viewer. No product DB or model calls."""
+"""Independent local evaluation workspace. Never opens the product DB."""
+from contextlib import asynccontextmanager
+import asyncio
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -10,16 +12,29 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from evaluation.cli import ROOT, load_bundle, load_jsonl
 from evaluation.scoring import evaluate
+from evaluation.workflow import Reviews, Runs, PROMPT, PROMPT_VERSION, LABEL_POLICY, POLICY_VERSION, outbound, valid_gold
 
 
-def create_app(data_root=None):
+def create_app(data_root=None, client_factory=None):
     root = Path(data_root or ROOT / 'data/evaluation').resolve()
-    app = FastAPI(title='知意 · 评测实验室')
+    reviews, runner = Reviews(root), Runs(root, client_factory)
+
+    @asynccontextmanager
+    async def lifespan(app):
+        yield
+        pending = [t for t in runner.tasks.values() if not t.done()]
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    app = FastAPI(title='知意 · 评测实验室', lifespan=lifespan)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=['127.0.0.1', 'localhost', '[::1]', 'testserver'])
 
     @app.middleware('http')
     async def boundary(request, call_next):
         if request.method not in {'GET', 'HEAD', 'OPTIONS'}:
+            if request.headers.get('content-type', '').split(';')[0] != 'application/json':
+                return JSONResponse({'detail': '需要 JSON 请求'}, status_code=415)
             origin = request.headers.get('origin')
             if origin and origin != str(request.base_url).rstrip('/'):
                 return JSONResponse({'detail': '不允许跨站导入'}, status_code=403)
@@ -39,7 +54,7 @@ def create_app(data_root=None):
             refs = load_jsonl(path / 'annotations.jsonl')
             if len(refs) != len(samples) or {r['sample_id'] for r in refs} != {s['sample_id'] for s in samples}:
                 raise ValueError('annotations mismatch')
-            return manifest, samples, {r['sample_id']: r for r in refs}
+            return manifest, samples, reviews.overlay(manifest['dataset_id'], {r['sample_id']: r for r in refs})
         except (OSError, ValueError, KeyError, TypeError):
             raise HTTPException(422, '数据包校验失败，请检查固定文件及标注文件')
 
@@ -57,6 +72,8 @@ def create_app(data_root=None):
             data = json.loads(run_path(run_id).read_text(encoding='utf-8'))
             if data['dataset_id'] != manifest['dataset_id'] or data['split'] != split:
                 raise ValueError('mismatch')
+            if data.get('status') == 'running' and run_id not in runner.tasks:
+                data['status'] = 'interrupted'
             return data
         except (OSError, ValueError, KeyError):
             raise HTTPException(422, '运行记录与所选数据版本或分组不匹配')
@@ -92,7 +109,11 @@ def create_app(data_root=None):
                              'timed_predictions': len(durations),
                              'tokens': sum(p['total_tokens'] for p in run['predictions'] if type(p.get('total_tokens')) is int and p['total_tokens'] >= 0),
                              'token_measurements': sum(type(p.get('total_tokens')) is int and p['total_tokens'] >= 0 for p in run['predictions'])}
-        result['quality'] = 'exploratory'
+        result['quality'] = 'human_reviewed' if samples and all(
+            refs[s['sample_id']].get('review_status') == 'adjudicated'
+            and len(set(refs[s['sample_id']].get('reviewers', []))) >= 2
+            and refs[s['sample_id']].get('annotation_version')
+            for s in samples) and all(result['pending_gold'].get(k) == 0 for k in manifest['labels']) else 'exploratory'
         return result
 
     @app.get('/api/datasets')
@@ -115,6 +136,10 @@ def create_app(data_root=None):
         manifest, all_samples, refs = bundle(key)
         selected = [s for s in all_samples if s['split'] == split]
         run = get_run(run_id, manifest, split) if run_id else None
+        if run and run.get('sample_ids'):
+            selected = [s for s in selected if s['sample_id'] in run['sample_ids']]
+        if run and run.get('references'):
+            refs = {r['sample_id']: r for r in run['references']}
         metrics = summarize(manifest, selected, refs, run)
         runs = []
         for path in sorted((root / 'ui-runs').glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True):
@@ -125,6 +150,10 @@ def create_app(data_root=None):
                 pass
         pred = {p['sample_id']: p for p in run['predictions']} if run else {}
         wrong = {e['sample_id'] for e in metrics['errors']}
+        if run:
+            wrong |= {s['sample_id'] for s in selected if s['sample_id'] not in pred
+                      or pred[s['sample_id']].get('status') != 'ok'
+                      or not valid_gold({k: pred[s['sample_id']].get(k) for k in manifest['labels']}, manifest['labels'])}
         rows = []
         for s in selected:
             last = s['input']['messages'][-1]
@@ -137,7 +166,7 @@ def create_app(data_root=None):
                          'review_status': refs[s['sample_id']].get('review_status')})
         return {'dataset': {'key': key, 'source': manifest['source'], 'labels': manifest['labels'], 'dataset_id': manifest['dataset_id']},
                 'metrics': metrics, 'runs': runs, 'rows': rows[(page - 1) * 30:page * 30], 'total': len(rows), 'page': page,
-                'run': {'run_id': run['run_id'], 'prompt_version': run['prompt_version']} if run else None,
+                'run': {k: run.get(k) for k in ['run_id', 'prompt_version', 'status', 'mode', 'model', 'started_at']} if run else None,
                 'counts': {'samples': len(selected), 'conversations': len({s['conversation_id'] for s in selected}),
                            'reviewed': sum(refs[s['sample_id']].get('review_status') == 'adjudicated' and len(set(refs[s['sample_id']].get('reviewers', []))) >= 2 for s in selected)}}
 
@@ -149,7 +178,86 @@ def create_app(data_root=None):
             raise HTTPException(404, '样本不在当前分组')
         run = get_run(run_id, manifest, split) if run_id else None
         return {'sample': item, 'annotation': refs[sample_id],
+                'label_policy': LABEL_POLICY, 'policy_version': POLICY_VERSION,
+                'review': reviews.read(manifest['dataset_id']).get(sample_id, {'revision': 0, 'votes': {}, 'history': []}),
+                'scored_annotation': next((r for r in run.get('references', []) if r['sample_id'] == sample_id), None) if run else None,
                 'prediction': next((p for p in run['predictions'] if p['sample_id'] == sample_id), None) if run else None}
+
+    @app.post('/api/review/{key}')
+    async def review(key: str, request: Request):
+        manifest, samples, refs = bundle(key)
+        data = await request.json()
+        item = next((s for s in samples if s['sample_id'] == data.get('sample_id')), None)
+        if not item:
+            raise HTTPException(404, '样本不存在')
+        if item['split'] == 'test':
+            raise HTTPException(403, '测试集锁定，请在独立盲审流程完成标注')
+        try:
+            return reviews.save(manifest, item, data)
+        except ValueError as exc:
+            raise HTTPException(409 if '冲突' in str(exc) else 422, str(exc))
+
+    def smoke_samples(key):
+        manifest, samples, refs = bundle(key)
+        if manifest['source'] != 'official_mock_replay':
+            raise HTTPException(403, '当前外发授权仅覆盖官方 S00053；CSDS 可先在本地复核')
+        selected = [s for s in samples if s['conversation_id'] == 'S00053' and s['split'] == 'dev']
+        if not selected or len(selected) > 10:
+            raise HTTPException(422, '授权范围内样本异常')
+        return manifest, selected, refs
+
+    @app.get('/api/baseline/preview/{key}')
+    def preview(key: str):
+        from app.core.config import get_settings
+        from urllib.parse import urlsplit
+        manifest, samples, refs = smoke_samples(key)
+        settings = get_settings()
+        return {'prompt': PROMPT, 'prompt_version': PROMPT_VERSION, 'count': len(samples),
+                'host': urlsplit(settings.openai_base_url).hostname, 'model': settings.openai_model,
+                'samples': [{'sample_id': s['sample_id'], 'input': outbound(s)} for s in samples],
+                'reviewed': sum(refs[s['sample_id']].get('review_status') == 'adjudicated' for s in samples)}
+
+    @app.post('/api/baseline/{key}')
+    async def baseline(key: str, request: Request):
+        from app.core.config import get_settings
+        from urllib.parse import urlsplit
+        manifest, samples, refs = smoke_samples(key)
+        data = await request.json()
+        if data.get('confirmed_scope') != 'official:S00053':
+            raise HTTPException(422, '请确认 S00053 外发范围')
+        settings = get_settings()
+        if settings.ai_provider != 'openai' or urlsplit(settings.openai_base_url).hostname != 'ws-k0ry66e5zn5pf7wy.cn-beijing.maas.aliyuncs.com' or settings.openai_model != 'qwen3.8-flash':
+            raise HTTPException(403, '模型目的地已变化，需要重新确认外发授权')
+        prompt, version = data.get('prompt', PROMPT), data.get('prompt_version', PROMPT_VERSION)
+        if not isinstance(prompt, str) or not 50 <= len(prompt) <= 8000 or not isinstance(version, str) or not 1 <= len(version) <= 100:
+            raise HTTPException(422, 'Prompt 长度 50–8000 字，版本名称 1–100 字')
+        if runner.active():
+            raise HTTPException(409, '已有评测正在运行，请等待完成或停止')
+        rid = runner.start(manifest, samples, refs, settings, prompt, version)
+        return {'id': rid, 'count': len(samples)}
+
+    @app.post('/api/stop/{run_id}')
+    async def stop(run_id: str):
+        run_path(run_id)
+        if run_id not in runner.tasks or runner.tasks[run_id].done():
+            raise HTTPException(409, '该任务未在当前进程运行')
+        runner.stops.add(run_id)
+        return {'status': 'stopping', 'note': '当前请求结束后停止，不再发起下一次调用'}
+
+    @app.post('/api/rescore/{key}')
+    async def rescore(key: str, request: Request):
+        manifest, samples, refs = bundle(key)
+        data = await request.json()
+        run = get_run(data.get('run_id', ''), manifest, data.get('split', 'dev'))
+        if run.get('status') == 'running':
+            raise HTTPException(409, '请等待运行结束再重新计分')
+        ids = run.get('sample_ids') or [s['sample_id'] for s in samples if s['split'] == run['split']]
+        run.update(references=[refs[sid] for sid in ids], sample_ids=ids,
+                   run_id=run['run_id'] + ' · 复核后重算', rescored_from=data['run_id'])
+        rid = uuid4().hex
+        from evaluation.workflow import atomic_json
+        atomic_json(run_path(rid), run)
+        return {'id': rid}
 
     @app.post('/api/import/{key}')
     async def import_run(key: str, request: Request):
