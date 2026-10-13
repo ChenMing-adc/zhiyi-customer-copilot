@@ -30,9 +30,9 @@ CSDS 与官方数据均已获用户授权使用现有阿里云配置运行，不
 
 每次运行冻结样本 ID、标准答案、Prompt 原文/哈希/版本、模型参数及口径版本。缺失/失败输出保留在计划样本分母中，缺失标准答案不冒充零分。页面统计“已确认”时包括单人确认；没有人工确认的原始 CSDS 标签仍标记探索性。标注修改或导入后重算生成新的运行记录，保留原记录。
 
-用户确认的官方口径：价保资格/补差申请归订单服务；仅缺失图片时情绪延续上一条可见买家消息；以退货施压也算投诉升级候选。两套标签不直接映射。
+旧 official-v1 保留此前中文标注口径。新版 official-v2 与 csds-v3 使用用户提供的 JSON 原始标签：只含情绪和意图，当前句的 neutral 不继承上一句情绪；两版口径不可混计。
 
-本工具测试独立分类与草稿 Prompt，不是线上多节点 Agent 全链路。草稿未经产品输出校验，不能直接发客户。风险仅两类候选，不含优先级。建议开发集调优、验证集检查、测试集最终验收；测试分组虽然开放，使用其结果调优后不能再称为未见盲测。
+本工具提供产品分析节点与回复节点评测，并保留旧独立评测器作历史对照。不是产品全链路验收；回复节点只测原始输出，不调用 BoundedRepair，也不发送客户。产品风险由关键词规则生成，不是分析 Prompt 的分类输出。建议开发集调优、验证集检查、测试集最终验收；测试分组虽然开放，使用其结果调优后不能再称为未见盲测。
 
 在仓库根目录运行，数据文件由使用者本地提供：
 
@@ -47,8 +47,8 @@ python scripts/evaluate.py demo --out data/evaluation/example-v1
 
 ## 数据包和复核
 
-- `samples.jsonl`：买家消息逐轮截点，最近 28 条消息（`--window` 可调整），显式白名单输入，不含真值、未来消息、场景标签。官方包为逐轮回放；并非全量复盘评测。
-- `annotations.jsonl`：独立标准答案。默认 `unreviewed`，官方标签为 `null`，不能把未标注风险视为无风险 `[]`。
+- `samples.jsonl`：买家消息逐轮截点，最近 28 条消息（`--window` 可调整），显式白名单输入，不含真值、未来消息、场景标签。旧 Excel 官方包为逐轮回放；新版官方标注 JSON 包为聊天文本评测，不拼接 Excel 业务事实，并非全量产品上下文验收。
+- `annotations.jsonl`：独立标准答案。旧 prepare 命令默认 `unreviewed`，旧官方 Excel 导入标签为 `null`。新版 refresh 命令保留源 JSON 标签，并记录用户确认完成；没有风险标注，不能补成无风险 `[]`。
 - `split.json`：会话分组和固定分配；近似完整会话自动同组，也支持 `--groups groups.json` 指定关联 ID 数组，例如 `[["A","B"],["C","D"]]`。按约 60/20/20 分配后，在不拆组、不改组数的前提下交换整组，改善出现在至少三个独立组中的标签覆盖；不保证各类均衡。
 - `coverage.json`：各分组类别覆盖和缺失标签。必须人工检查；投诉等极少类别不能通过拆散同一会话来补足。跨来源模板相似性需人工检查；自动近似检测不能证明没有泄漏。
 - `manifest.json`：来源哈希、输入/分组哈希、标签集合、窗口和 dataset_id。固定输入或分组被改动时拒绝评分；需要重新准备新版本。
@@ -98,14 +98,33 @@ python -m unittest discover -s tests -p test_evaluation.py -v
 python -m unittest discover -s tests -v
 ```
 
-真实数据、标注、分组、预测、报告均位于已忽略的 `data/` 中。此 README 仅是工具必要使用说明；不包含业务样本或标准答案。后续真实模型运行器、Prompt 版本和自动对比另行实现，本轮没有修改线上 Prompt 或 `.env`。
+真实数据、标注、分组、预测、报告均位于已忽略的 `data/` 中。此 README 仅是工具必要使用说明；不包含业务样本或标准答案。产品与评测复用节点消息构造和校验函数；产品默认 Prompt、中文标签、自动修正流程与 `.env` 保持不变。
 
 ## Prompt 版本与评测范围
 
 运行窗口打开即加载版本列表，与样本预览解耦。可选择内置版本、已有运行记录中的历史 Prompt 或本地自定义版本。选择已存版本时只读；点击“复制为自定义版本”或“新建空白版本”，填写新名称和正文后保存。名称不能重复，旧版本不覆盖。运行按所选版本 ID 从服务端读取，不使用前端伪造的同名正文。
 
-内置默认仍来自 `evaluation/workflow.py` 的 `PROMPT`/`PROMPT_VERSION`；历史版本读取 `data/evaluation/ui-runs/*.json` 的运行快照；自定义版本写入被 Git 忽略的 `data/evaluation/prompts/library.json`。每次运行另外保存版本 ID、名称、正文、SHA256，以及数据集标签枚举。库为本机持久化，不自动跨电脑同步。
+内置分析/回复版本来自 `app/copilot/analysis.py` 的 `analysis_prompt()` / `reply_prompt()`；分析版本将枚举替换成 `{{intent_labels}}`、`{{emotion_labels}}` 模板位，由所选数据集填充。旧独立评测器仍读取 `evaluation/workflow.py`。历史版本读取 `data/evaluation/ui-runs/*.json`；自定义版本写入 `data/evaluation/prompts/library.json`。版本按节点隔离，同一节点不覆盖旧名称。
 
-当前模式为独立的 `isolated_classifier`，一次调用输入两个消息：system 为所选 Prompt 加该数据集标签枚举，user 为目标消息 ID、当前截点可见消息和必要事实 JSON。不发送人工 gold 或未来消息。输出 JSON 包括 emotion、intent、risk、draft；CSDS 只计分情绪/意图，官方数据可计分情绪/意图/两类风险候选。回复草稿仅展示和检查结构，未自动评分。
+每次运行冻结版本 ID、正文、SHA256、标签空间、标准答案、节点模式；每条节点预测保存实际 system/user 输入、原始输出、耗时及模型返回的 token 用量。回复运行还冻结分析结果和来源运行 ID。自定义版本是本地持久化，不自动同步或应用到产品。
 
-产品 `app/copilot/analysis.py` 中 SituationAnalyst（情境分析）、ReplyPlanner（推荐回复）和 BoundedRepair（有限修正）的 Prompt 尚未接入本评测运行器；页面改动不会更新产品节点。不能将此处得分作为这些产品节点的完整验收结果。
+## 两个节点的评测流程
+
+1. 选择数据版本、分组，点击“配置节点评测”。
+2. 选择“分析节点 · SituationAnalyst”，选择/复制 Prompt，勾选会话或截点，预览实际外发输入后运行。一次调用返回 intent、emotion、trend、emotion_evidence、summary、missing_info、next_action；复用产品 JSON 和证据引用校验。情绪、意图自动计分，摘要语义和趋势尚不自动评分。
+3. 选择“回复节点 · ReplyPlanner”，下拉选择同数据版本、同分组下已结束的分析记录。样本列表只显示其中成功分析的截点。使用同一份固定分析输入比较不同回复 Prompt，不重新调用分析节点。
+4. 回复节点一次调用输出中文正文，展示产品 `validate_draft` 校验结果和 80–180 字长度符合率。失败/未返回留在分母中，不调用自动修正、不调用模型裁判。
+5. 在具体回复下人工评分：事实有依据、回应诉求、语气共情、下一步可行。填写评分人与理由，保存后更新指标。四项全通过才计为人工通过；未评分不算通过，报告同时显示评分覆盖数。评分有版本冲突保护及修改历史，保存在 `data/evaluation/reply-reviews/<run_id>.json`，目前需随本地评测目录共享，不包含在分类标注导出包里。
+
+产品继续使用原中文标签。评测使用数据集独立标签配置，不能直接整段覆盖产品 Prompt；迁移时需恢复产品标签并进行产品验收。两套最新 JSON 都没有风险真值与回复质量标注，因此不能宣称“风险和回复也已标注完成”。当前评测输入最多 28 条可见消息，使用产品节点消息结构；未携带时间戳，依赖等待时长的情绪标注需单独检查。
+
+## 替换用户完成的标注数据
+
+保留旧数据包，创建新版本并严格沿用原有会话划分；会话或买家截点成员变化时拒绝直接替换，要求先核对。
+
+```powershell
+python -m evaluation.refresh --source ../情绪数据集/官方数据美妆标注.json --previous data/evaluation/official-v1 --out data/evaluation/official-v2 --reviewer 用户提供的已完成标注
+python -m evaluation.refresh --source ../情绪数据集/CSDS美妆标注.json --previous data/evaluation/csds-v2 --out data/evaluation/csds-v3 --reviewer 用户提供的已完成标注
+```
+
+目录必须是新目录。新版官方为 138 会话 / 487 截点，CSDS 为 91 会话 / 1,388 截点。两个包独立统计，不将分数合并。新版使用 JSON 聊天和其原始标签，不借用未来客服回复作输入、不推造订单工单字段。旧运行仍属于旧 dataset_id，新标注不会覆盖旧运行保存的答案。

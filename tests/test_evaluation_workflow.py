@@ -91,7 +91,7 @@ class WorkflowTests(unittest.TestCase):
         path = self.root / 'ui-runs'
         path.mkdir()
         (path / 'old.json').write_text(json.dumps({'mode': 'isolated_classifier', 'prompt_version': 'old-v1', 'prompt': PROMPT + 'old'}), encoding='utf-8')
-        self.assertEqual(len(library.entries()), 3)
+        self.assertEqual(len(library.entries()), 5)
         with TestClient(create_app(self.root)) as c:
             self.assertEqual(len(c.get('/api/prompts').json()['entries']), 3)
             self.assertEqual(c.post('/api/prompts', json={'version': 'new-v2', 'prompt': PROMPT}).status_code, 200)

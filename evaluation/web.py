@@ -12,7 +12,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from evaluation.cli import ROOT, load_bundle, load_jsonl
 from evaluation.scoring import evaluate
-from evaluation.workflow import Reviews, Runs, PROMPT, PROMPT_VERSION, LABEL_POLICY, POLICY_VERSION, outbound, valid_gold
+from evaluation.workflow import Reviews, Runs, PROMPT, PROMPT_VERSION, LABEL_POLICY, POLICY_VERSION, outbound, valid_gold, label_policy
 from evaluation.prompts import PromptLibrary
 
 
@@ -86,7 +86,7 @@ def create_app(data_root=None, client_factory=None):
         if not run:
             return result
         predictions = {p['sample_id']: p for p in run['predictions']}
-        for task, classes in manifest['labels'].items():
+        for task, classes in ({} if run.get('mode') == 'reply' else manifest['labels']).items():
             eligible = []
             for sample in samples:
                 ref = refs[sample['sample_id']]
@@ -119,8 +119,11 @@ def create_app(data_root=None, client_factory=None):
         return result
 
     @app.get('/api/prompts')
-    def prompt_versions():
-        return {'entries': prompts.entries(), 'default_id': 'builtin:' + PROMPT_VERSION}
+    def prompt_versions(mode: str = 'isolated_classifier'):
+        defaults = {'analysis': 'builtin:situation-v1', 'reply': 'builtin:reply-v1', 'isolated_classifier': 'builtin:' + PROMPT_VERSION}
+        if mode not in defaults:
+            raise HTTPException(422, '未知评测节点')
+        return {'entries': [e for e in prompts.entries() if e['mode'] == mode], 'default_id': defaults[mode]}
 
     @app.post('/api/prompts')
     async def save_prompt(request: Request):
@@ -129,7 +132,7 @@ def create_app(data_root=None, client_factory=None):
             raise HTTPException(413, 'Prompt 文件过大')
         try:
             data = json.loads(content)
-            return prompts.save(data.get('version'), data.get('prompt'))
+            return prompts.save(data.get('version'), data.get('prompt'), data.get('mode', 'isolated_classifier'))
         except (ValueError, AttributeError) as exc:
             raise HTTPException(422, str(exc))
 
@@ -140,7 +143,7 @@ def create_app(data_root=None, client_factory=None):
             try:
                 manifest, samples, refs = bundle(path.parent.name)
                 output.append({'key': path.parent.name, 'source': manifest['source'], 'dataset_id': manifest['dataset_id'],
-                               'count': len(samples), 'conversations': len({s['conversation_id'] for s in samples}),
+                               'input_scope': manifest.get('input_scope', 'replay'), 'count': len(samples), 'conversations': len({s['conversation_id'] for s in samples}),
                                'splits': {split: sum(s['split'] == split for s in samples) for split in ['dev', 'validation', 'test']}})
             except HTTPException:
                 invalid.append(path.parent.name)
@@ -159,11 +162,14 @@ def create_app(data_root=None, client_factory=None):
         if run and run.get('references'):
             refs = {r['sample_id']: r for r in run['references']}
         metrics = summarize(manifest, selected, refs, run)
+        if run and run.get('mode') == 'reply':
+            from evaluation.nodes import reply_metrics
+            metrics['reply'] = reply_metrics(selected, run['predictions'], read_ratings(run_id))
         runs = []
         for path in sorted((root / 'ui-runs').glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True):
             try:
                 item = get_run(path.stem, manifest, split)
-                runs.append({'id': path.stem, 'name': item['run_id'], 'prompt_version': item['prompt_version']})
+                runs.append({'id': path.stem, 'name': item['run_id'], 'prompt_version': item['prompt_version'], 'mode': item.get('mode', 'imported')})
             except HTTPException:
                 pass
         pred = {p['sample_id']: p for p in run['predictions']} if run else {}
@@ -171,7 +177,7 @@ def create_app(data_root=None, client_factory=None):
         if run:
             wrong |= {s['sample_id'] for s in selected if s['sample_id'] not in pred
                       or pred[s['sample_id']].get('status') != 'ok'
-                      or not valid_gold({k: pred[s['sample_id']].get(k) for k in manifest['labels']}, manifest['labels'])}
+                      or (pred[s['sample_id']].get('validator_pass') is False if run.get('mode') == 'reply' else not valid_gold({k: pred[s['sample_id']].get(k) for k in manifest['labels']}, manifest['labels']))}
         rows = []
         for s in selected:
             last = s['input']['messages'][-1]
@@ -205,10 +211,42 @@ def create_app(data_root=None, client_factory=None):
             raise HTTPException(404, '样本不在当前分组')
         run = get_run(run_id, manifest, split) if run_id else None
         return {'sample': item, 'annotation': refs[sample_id],
-                'label_policy': LABEL_POLICY, 'policy_version': POLICY_VERSION,
+                'label_policy': label_policy(manifest)[0], 'policy_version': label_policy(manifest)[1],
+                'reply_review': read_ratings(run_id).get(sample_id) if run else None,
+                'run_mode': run.get('mode') if run else None,
                 'review': reviews.read(manifest['dataset_id']).get(sample_id, {'revision': 0, 'votes': {}, 'history': []}),
                 'scored_annotation': next((r for r in run.get('references', []) if r['sample_id'] == sample_id), None) if run else None,
                 'prediction': next((p for p in run['predictions'] if p['sample_id'] == sample_id), None) if run else None}
+
+    def read_ratings(rid):
+        run_path(rid)
+        path = root / 'reply-reviews' / (rid + '.json')
+        return json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+
+    @app.post('/api/reply-review/{key}')
+    async def reply_review(key: str, request: Request):
+        from evaluation.workflow import atomic_json, now
+        data = await request.json()
+        manifest, _, _ = bundle(key)
+        rid = data.get('run_id', '')
+        run = get_run(rid, manifest, data.get('split', 'dev'))
+        sid = data.get('sample_id')
+        if run.get('mode') != 'reply' or not any(p['sample_id'] == sid and p.get('status') == 'ok' for p in run['predictions']):
+            raise HTTPException(422, '仅对已有回复节点输出评分')
+        scores = data.get('scores')
+        if not isinstance(scores, dict) or set(scores) != {'grounded', 'responsive', 'empathetic', 'actionable'} or not all(type(v) is bool for v in scores.values()):
+            raise HTTPException(422, '请完成四项回复质量评分')
+        reviewer, note = data.get('reviewer'), data.get('note')
+        if not isinstance(reviewer, str) or not 1 <= len(reviewer.strip()) <= 60 or not isinstance(note, str) or not 1 <= len(note.strip()) <= 1000:
+            raise HTTPException(422, '填写评分人和评分理由')
+        ratings = read_ratings(rid)
+        old = ratings.get(sid, {})
+        if data.get('revision') != old.get('revision', 0):
+            raise HTTPException(409, '评分已变化，请刷新后重试')
+        ratings[sid] = dict(scores=scores, reviewer=reviewer.strip(), note=note.strip(), at=now(),
+                            revision=old.get('revision', 0) + 1, history=[*old.get('history', []), {k: v for k, v in old.items() if k != 'history'}] if old else [])
+        atomic_json(root / 'reply-reviews' / (rid + '.json'), ratings)
+        return ratings[sid]
 
     @app.post('/api/review/{key}')
     async def review(key: str, request: Request):
@@ -265,28 +303,74 @@ def create_app(data_root=None, client_factory=None):
             raise HTTPException(422, '所选范围没有样本')
         return manifest, selected, refs
 
-    def selection_hash(manifest, samples, settings):
+    def execution(data, manifest, samples):
+        mode = data.get('mode', 'isolated_classifier')
+        if mode not in {'analysis', 'reply', 'isolated_classifier'}:
+            raise HTTPException(422, '未知评测节点')
+        defaults = {'analysis': 'builtin:situation-v1', 'reply': 'builtin:reply-v1'}
+        identity = data.get('prompt_id') or defaults.get(mode)
+        prompt, version = data.get('prompt', PROMPT), data.get('prompt_version', PROMPT_VERSION)
+        if identity:
+            try:
+                entry = prompts.get(identity)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc))
+            if entry['mode'] != mode:
+                raise HTTPException(422, 'Prompt 不属于所选节点')
+            prompt, version = entry['prompt'], entry['version']
+        if not isinstance(prompt, str) or not 50 <= len(prompt) <= 8000 or not isinstance(version, str) or not 1 <= len(version) <= 100:
+            raise HTTPException(422, 'Prompt 长度 50–8000 字，版本名称 1–100 字')
+        base = None
+        if mode == 'reply':
+            rid = data.get('analysis_run_id', '')
+            run = get_run(rid, manifest, samples[0]['split'])
+            if run.get('mode') != 'analysis' or run.get('status') == 'running':
+                raise HTTPException(422, '请选择已结束的分析节点运行记录')
+            analyses = {p['sample_id']: p['analysis'] for p in run['predictions'] if p.get('status') == 'ok' and p.get('analysis')}
+            if any(s['sample_id'] not in analyses for s in samples):
+                raise HTTPException(422, '所选截点必须全部具有该分析记录的有效结果')
+            base = {'id': rid, 'prompt_version': run['prompt_version'], 'analyses': {s['sample_id']: analyses[s['sample_id']] for s in samples}}
+        return mode, identity, prompt, version, base
+
+    def prepared_inputs(samples, manifest, mode, prompt, base):
+        if mode == 'isolated_classifier':
+            return [{'sample_id': s['sample_id'], 'input': outbound(s)} for s in samples]
+        from evaluation.nodes import node_input
+        try:
+            return [{'sample_id': s['sample_id'], 'input': [m.model_dump() for m in node_input(s, mode, prompt, manifest['labels'], (base or {}).get('analyses', {}).get(s['sample_id']))[1]]} for s in samples]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(422, '节点输入或固定分析结果未通过校验：' + type(exc).__name__)
+
+    def selection_hash(manifest, inputs, settings):
         import hashlib
-        return hashlib.sha256(json.dumps({'dataset': manifest['dataset_id'],
-            'inputs': [{'id': s['sample_id'], 'input': outbound(s)} for s in samples],
+        return hashlib.sha256(json.dumps({'dataset': manifest['dataset_id'], 'inputs': inputs,
             'destination': settings.openai_base_url, 'model': settings.openai_model},
             sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
     @app.get('/api/baseline/preview/{key}')
-    def preview(key: str, split: str = 'dev', conversation: str = '', limit: int = 0, sample_ids=None):
+    def preview(key: str, split: str = 'dev', conversation: str = '', limit: int = 0, sample_ids=None,
+                mode: str = 'isolated_classifier', prompt_id: str = '', analysis_run_id: str = ''):
         from app.core.config import get_settings
         from urllib.parse import urlsplit
         manifest, samples, refs = selected_samples(key, split, conversation, limit, sample_ids)
+        mode, identity, prompt, version, base = execution(dict(mode=mode, prompt_id=prompt_id, analysis_run_id=analysis_run_id), manifest, samples)
+        inputs = prepared_inputs(samples, manifest, mode, prompt, base)
         settings = get_settings()
-        return {'prompt': PROMPT, 'prompt_version': PROMPT_VERSION, 'count': len(samples),
-                'selection_hash': selection_hash(manifest, samples, settings),
+        return {'prompt': prompt, 'prompt_version': version, 'count': len(samples), 'mode': mode,
+                'selection_hash': selection_hash(manifest, inputs, settings),
                 'host': urlsplit(settings.openai_base_url).hostname, 'model': settings.openai_model,
-                'samples': [{'sample_id': s['sample_id'], 'input': outbound(s)} for s in samples],
+                'samples': inputs,
                 'reviewed': sum(refs[s['sample_id']].get('review_status') in {'confirmed', 'adjudicated'} for s in samples)}
 
     @app.get('/api/baseline/catalog/{key}')
-    def selection_catalog(key: str, split: str = 'dev'):
-        _, samples, refs = selected_samples(key, split)
+    def selection_catalog(key: str, split: str = 'dev', analysis_run_id: str = ''):
+        manifest, samples, refs = selected_samples(key, split)
+        if analysis_run_id:
+            run = get_run(analysis_run_id, manifest, split)
+            if run.get('mode') != 'analysis' or run.get('status') == 'running':
+                raise HTTPException(422, '请选择已结束的分析节点运行记录')
+            available = {p['sample_id'] for p in run['predictions'] if p.get('status') == 'ok' and p.get('analysis')}
+            samples = [s for s in samples if s['sample_id'] in available]
         groups = {}
         for sample in samples:
             groups.setdefault(sample['conversation_id'], []).append({
@@ -298,7 +382,7 @@ def create_app(data_root=None, client_factory=None):
     @app.post('/api/baseline/preview/{key}')
     async def selected_preview(key: str, request: Request):
         data = await request.json()
-        return preview(key, data.get('split', 'dev'), data.get('conversation', ''), data.get('limit', 0), data.get('sample_ids'))
+        return preview(key, data.get('split', 'dev'), data.get('conversation', ''), data.get('limit', 0), data.get('sample_ids'), data.get('mode', 'isolated_classifier'), data.get('prompt_id', ''), data.get('analysis_run_id', ''))
 
     @app.post('/api/baseline/{key}')
     async def baseline(key: str, request: Request):
@@ -309,20 +393,13 @@ def create_app(data_root=None, client_factory=None):
         settings = get_settings()
         if settings.ai_provider != 'openai' or urlsplit(settings.openai_base_url).hostname != 'ws-k0ry66e5zn5pf7wy.cn-beijing.maas.aliyuncs.com' or settings.openai_model != 'qwen3.8-flash':
             raise HTTPException(403, '模型目的地已变化，需要重新确认外发授权')
-        if data.get('selection_hash') != selection_hash(manifest, samples, settings):
-            raise HTTPException(409, '请先预览所选范围；数据或模型配置变化后需重新预览')
-        prompt, version = data.get('prompt', PROMPT), data.get('prompt_version', PROMPT_VERSION)
-        if data.get('prompt_id'):
-            try:
-                entry = prompts.get(data['prompt_id'])
-                prompt, version = entry['prompt'], entry['version']
-            except ValueError as exc:
-                raise HTTPException(422, str(exc))
-        if not isinstance(prompt, str) or not 50 <= len(prompt) <= 8000 or not isinstance(version, str) or not 1 <= len(version) <= 100:
-            raise HTTPException(422, 'Prompt 长度 50–8000 字，版本名称 1–100 字')
+        mode, identity, prompt, version, base = execution(data, manifest, samples)
+        inputs = prepared_inputs(samples, manifest, mode, prompt, base)
+        if data.get('selection_hash') != selection_hash(manifest, inputs, settings):
+            raise HTTPException(409, '请先预览；样本、Prompt、固定分析结果或模型变化后需重新预览')
         if runner.active():
             raise HTTPException(409, '已有评测正在运行，请等待完成或停止')
-        rid = runner.start(manifest, samples, refs, settings, prompt, version, data.get('prompt_id'))
+        rid = runner.start(manifest, samples, refs, settings, prompt, version, identity, mode, base)
         return {'id': rid, 'count': len(samples)}
 
     @app.post('/api/stop/{run_id}')
@@ -340,6 +417,8 @@ def create_app(data_root=None, client_factory=None):
         run = get_run(data.get('run_id', ''), manifest, data.get('split', 'dev'))
         if run.get('status') == 'running':
             raise HTTPException(409, '请等待运行结束再重新计分')
+        if run.get('mode') == 'reply':
+            raise HTTPException(422, '回复质量评分保存后自动更新，无需重算分类标签')
         ids = run.get('sample_ids') or [s['sample_id'] for s in samples if s['split'] == run['split']]
         run.update(references=[refs[sid] for sid in ids], sample_ids=ids,
                    run_id=run['run_id'] + ' · 复核后重算', rescored_from=data['run_id'])

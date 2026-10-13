@@ -20,20 +20,22 @@ class PromptLibrary:
     def entries(self):
         entries = [{'id': 'builtin:' + PROMPT_VERSION, 'version': PROMPT_VERSION,
                     'prompt': PROMPT, 'source': 'builtin', 'mode': 'isolated_classifier'}]
+        from evaluation.nodes import builtin_prompts
+        entries += builtin_prompts()
         entries += self.custom()
-        seen = {(e['version'], e['prompt']) for e in entries}
+        seen = {(e['mode'], e['version'], e['prompt']) for e in entries}
         for path in sorted((self.root / 'ui-runs').glob('*.json')):
             if path.is_symlink():
                 continue
             try:
                 run = json.loads(path.read_text(encoding='utf-8'))
                 version, prompt = run.get('prompt_version'), run.get('prompt')
-                if run.get('mode') != 'isolated_classifier' or not isinstance(version, str) or not isinstance(prompt, str) or not prompt.strip() or (version, prompt) in seen:
+                if run.get('mode') not in {'isolated_classifier', 'analysis', 'reply'} or not isinstance(version, str) or not isinstance(prompt, str) or not prompt.strip() or (run['mode'], version, prompt) in seen:
                     continue
-                identity = hashlib.sha256(json.dumps([version, prompt], ensure_ascii=False).encode()).hexdigest()
+                identity = hashlib.sha256(json.dumps([run['mode'], version, prompt], ensure_ascii=False).encode()).hexdigest()
                 entries.append({'id': 'history:' + identity, 'version': version, 'prompt': prompt,
-                                'source': 'history', 'mode': 'isolated_classifier'})
-                seen.add((version, prompt))
+                                'source': 'history', 'mode': run['mode']})
+                seen.add((run['mode'], version, prompt))
             except (OSError, ValueError, AttributeError):
                 continue
         return [{**e, 'sha256': hashlib.sha256(e['prompt'].encode()).hexdigest()} for e in entries]
@@ -44,15 +46,17 @@ class PromptLibrary:
             raise ValueError('Prompt 版本不存在，请刷新版本列表')
         return entry
 
-    def save(self, version, prompt):
+    def save(self, version, prompt, mode='isolated_classifier'):
+        if mode not in {'isolated_classifier', 'analysis', 'reply'}:
+            raise ValueError('未知评测节点')
         if not isinstance(version, str) or not 1 <= len(version.strip()) <= 100:
             raise ValueError('版本名称需要 1–100 个字符')
         if not isinstance(prompt, str) or not 50 <= len(prompt.strip()) <= 8000:
             raise ValueError('Prompt 需要 50–8000 个字符')
         version, prompt = version.strip(), prompt.strip()
-        if any(e['version'].casefold() == version.casefold() for e in self.entries()):
+        if any(e['mode'] == mode and e['version'].casefold() == version.casefold() for e in self.entries()):
             raise ValueError('版本名称已存在，请使用新名称；旧版本不覆盖')
         entry = {'id': 'custom:' + uuid4().hex, 'version': version, 'prompt': prompt,
-                 'source': 'custom', 'mode': 'isolated_classifier', 'created_at': now()}
+                 'source': 'custom', 'mode': mode, 'created_at': now()}
         atomic_json(self.path, [*self.custom(), entry])
         return self.get(entry['id'])

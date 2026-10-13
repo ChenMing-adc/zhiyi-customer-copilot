@@ -13,6 +13,16 @@ LABEL_POLICY = ('官方数据：价保资格、补差申请归订单服务；进
                 '买家仅发缺失图片时，情绪延续上一条可见买家消息；无可见前文则无法判断。'
                 '图片内容和办理状态仍不得推测。以退货施压也列为投诉升级候选，不要求出现投诉/举报字样。'
                 'CSDS 使用原有独立标签空间，不强行套用官方意图枚举。')
+IMPORTED_POLICY = ('以用户提供的最新标注文件为标准：当前句无新感受、客套、发图确认标 neutral，'
+                   '不自动延续上一句情绪；意图在事项办结或买家明确改口前保持。'
+                   'price 含价保/补差；退款、退货、换货办理属 refund；明确投诉属 complaint。'
+                   '仅计分 emotion 与 intent，不含风险或回复质量标准答案。')
+
+
+def label_policy(manifest):
+    if manifest.get('annotation_policy') == 'supplied-json-labels':
+        return IMPORTED_POLICY, 'supplied-json-labels-v1'
+    return LABEL_POLICY, POLICY_VERSION
 
 
 def now():
@@ -83,13 +93,13 @@ class Reviews:
         if not note or len(note) > 1000:
             raise ValueError('填写简短标注理由（不超过 1000 字）')
         vote = {'reviewer': reviewer, 'gold': payload['gold'], 'evidence_ids': evidence, 'note': note,
-                'at': now(), 'policy_version': POLICY_VERSION}
+                'at': now(), 'policy_version': label_policy(manifest)[1]}
         item['revision'] += 1
         item['history'].append({**vote, 'action': 'save', 'revision': item['revision']})
         item['resolved'] = {'gold': vote['gold'], 'evidence_ids': vote['evidence_ids'],
                             'review_status': 'confirmed', 'reviewers': [reviewer],
                             'annotation_version': f"review-{item['revision']}", 'note': vote['note']}
-        item['resolved']['policy_version'] = POLICY_VERSION
+        item['resolved']['policy_version'] = vote['policy_version']
         data[sid] = item
         atomic_json(self.path(manifest['dataset_id']), data)
         return item
@@ -161,12 +171,13 @@ class Runs:
     def active(self):
         return any(not t.done() for t in self.tasks.values())
 
-    def start(self, manifest, samples, refs, settings, prompt, version, prompt_id=None):
+    def start(self, manifest, samples, refs, settings, prompt, version, prompt_id=None, mode='isolated_classifier', analysis_run=None):
         rid = uuid4().hex
-        data = {'dataset_id': manifest['dataset_id'], 'split': samples[0]['split'], 'run_id': manifest['source'] + ' · ' + now(),
+        title = {'analysis': '分析节点', 'reply': '回复节点', 'isolated_classifier': '旧独立评测器'}[mode]
+        data = {'dataset_id': manifest['dataset_id'], 'split': samples[0]['split'], 'run_id': title + ' · ' + now(),
                 'prompt_version': version, 'prompt_id': prompt_id, 'prompt': prompt, 'prompt_sha256': hashlib.sha256(prompt.encode()).hexdigest(),
-                'mode': 'isolated_classifier', 'model': settings.openai_model if settings.ai_provider == 'openai' else settings.ollama_model,
-                'policy_version': POLICY_VERSION,
+                'mode': mode, 'analysis_run': analysis_run, 'model': settings.openai_model if settings.ai_provider == 'openai' else settings.ollama_model,
+                'policy_version': label_policy(manifest)[1],
                 'provider': settings.ai_provider, 'temperature': settings.ai_temperature, 'max_tokens': settings.ai_max_tokens,
                 'sample_ids': [s['sample_id'] for s in samples], 'references': [refs[s['sample_id']] for s in samples],
                 'predictions': [], 'status': 'running', 'started_at': now(),
@@ -182,7 +193,13 @@ class Runs:
                 if rid in self.stops:
                     break
                 client = self.client_factory(settings) if self.client_factory else ServiceAiClient(settings)
-                data['predictions'].append(await predict(sample, data['labels'], data['prompt'], client))
+                if data.get('mode', 'isolated_classifier') == 'isolated_classifier':
+                    prediction = await predict(sample, data['labels'], data['prompt'], client)
+                else:
+                    from evaluation.nodes import predict_node
+                    source = (data.get('analysis_run') or {}).get('analyses', {}).get(sample['sample_id'])
+                    prediction = await predict_node(sample, data['labels'], data['prompt'], client, data['mode'], source)
+                data['predictions'].append(prediction)
                 atomic_json(self.path(rid), data)
                 # Fail fast; do not keep charging after a bad provider/config response.
                 if data['predictions'][-1]['status'] != 'ok':
