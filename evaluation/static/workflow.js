@@ -94,6 +94,7 @@ let polling=false;
 setInterval(async()=>{
  const run=state?.run;
  $('run-stop').disabled=demo||run?.status!=='running';
+ $('run-resume').disabled=demo||!['failed','cancelled','interrupted'].includes(run?.status);
  $('rescore').disabled=demo||!run||run.status==='running'||run.mode==='reply';
  $('run-progress').textContent=demo?'人工示例，不调用模型':run?.status?`运行状态：${({running:'运行中',completed:'已完成',failed:'失败，已停止后续调用',cancelled:'已停止',interrupted:'服务重启中断'})[run.status]||run.status} · ${state.metrics.received_predictions}/${state.counts.samples} · ${run.model||''} · ${run.prompt_version}`:'未选择在线评测任务';
  if(!demo&&run?.status==='running'&&!polling){polling=true;try{const sid=selected;await load();if(sid)await showSample(sid);}finally{polling=false;}}
@@ -190,3 +191,20 @@ async function reloadBatchCatalog(){
  const d=await api(`/api/baseline/catalog/${encodeURIComponent(baselineKey)}?${new URLSearchParams(selection)}`);if(ticket!==catalogEpoch)return;
  batchCatalog=d.groups;const allowed=new Set(batchCatalog.flatMap(g=>g.samples.map(s=>s.id)));batchSelected=new Set([...batchSelected].filter(id=>allowed.has(id)));batchActive=activeConversation;renderBatch();
 }
+
+let resumeSelection=null;
+$('resume-close').onclick=()=>$('resume-dialog').close();
+$('run-resume').onclick=async()=>{
+ try{const key=$('dataset').value,run_id=$('run').value,split=$('split').value;
+ const d=await api(`/api/resume/${encodeURIComponent(key)}?${new URLSearchParams({run_id,split})}`);
+ resumeSelection={key,run_id,split,token:d.token};
+ $('resume-summary').textContent=`共 ${d.total} 条，保留成功 ${d.reused} 条，补跑 ${d.pending} 条。版本 ${d.prompt_version} · ${d.model}。${d.last_error?'最近失败：'+d.failed_sample+' · '+d.last_error:''}`;
+ $('resume-status').textContent='';$('resume-start').textContent=`补跑 ${d.pending} 条`;$('resume-dialog').showModal();
+ }catch(e){notice(e.message);}
+};
+$('resume-start').onclick=async()=>{
+ $('resume-start').disabled=true;
+ try{const d=await post(`/api/resume/${encodeURIComponent(resumeSelection.key)}`,resumeSelection);
+ $('resume-dialog').close();$('run').innerHTML=`<option value="${d.id}">断点重试</option>`;await load();notice(`已复用 ${d.reused} 条成功结果，补跑 ${d.pending} 条。原失败记录保留。`);
+ }catch(e){$('resume-status').textContent=e.message;}finally{$('resume-start').disabled=false;}
+};

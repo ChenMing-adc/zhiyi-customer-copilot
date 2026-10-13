@@ -171,6 +171,21 @@ class Runs:
     def active(self):
         return any(not t.done() for t in self.tasks.values())
 
+    def resume(self, original_id, original, samples, settings):
+        data = deepcopy(original)
+        data['predictions'] = [p for p in data['predictions'] if p.get('status') == 'ok']
+        successful = {p['sample_id'] for p in data['predictions']}
+        pending = [s for s in samples if s['sample_id'] not in successful]
+        if not pending:
+            raise ValueError('没有待重试样本')
+        rid = uuid4().hex
+        data.update(status='running', started_at=now(), resumed_from=original_id,
+                    reused_predictions=len(successful), run_id=original['run_id'] + ' · 断点重试')
+        data.pop('finished_at', None)
+        atomic_json(self.path(rid), data)
+        self.tasks[rid] = asyncio.create_task(self.execute(rid, data, pending, settings))
+        return rid
+
     def start(self, manifest, samples, refs, settings, prompt, version, prompt_id=None, mode='isolated_classifier', analysis_run=None):
         rid = uuid4().hex
         title = {'analysis': '分析节点', 'reply': '回复节点', 'isolated_classifier': '旧独立评测器'}[mode]
