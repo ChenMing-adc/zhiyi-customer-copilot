@@ -1,0 +1,2 @@
+# CSDS audit, splitting, scoring and demos use the Python standard library only.
+# prepare-official additionally uses the existing requirements.txt dependencies.
