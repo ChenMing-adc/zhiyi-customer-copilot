@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 from fastapi.testclient import TestClient
 from app.copilot.analysis import analysis_prompt, reply_prompt, situation_messages, reply_messages, Situation
@@ -126,8 +126,8 @@ class NodeTests(unittest.TestCase):
         class Client:
             async def stream(self, messages):
                 calls.append(messages)
-                yield json.dumps({**good, 'emotion_evidence': []} if len(calls) == 2 else good)
-        with patch('app.core.config.get_settings', return_value=self.settings), TestClient(create_app(self.root, lambda _: Client())) as c:
+                yield json.dumps({**good, 'emotion_evidence': []} if 2 <= len(calls) <= 7 else good)
+        with patch('evaluation.workflow.Runs.retry_wait', new_callable=AsyncMock), patch('app.core.config.get_settings', return_value=self.settings), TestClient(create_app(self.root, lambda _: Client())) as c:
             selection = dict(mode='analysis', split='dev', prompt_id='builtin:situation-v1')
             preview = c.post('/api/baseline/preview/fixture', json=selection).json()
             rid = c.post('/api/baseline/fixture', json={**selection, 'selection_hash': preview['selection_hash']}).json()['id']
@@ -144,7 +144,7 @@ class NodeTests(unittest.TestCase):
             self.settings.ai_max_tokens = 512
             resumed = c.post('/api/resume/fixture', json={'run_id': rid, 'token': plan['token']}).json()['id']
             saved = json.loads((self.root / 'ui-runs' / (resumed + '.json')).read_text(encoding='utf-8'))
-            self.assertEqual(len(calls), 3)
+            self.assertEqual(len(calls), 8)
             self.assertEqual(saved['status'], 'completed')
             self.assertEqual(saved['resumed_from'], rid)
             self.assertEqual(saved['references'], original['references'])

@@ -199,7 +199,7 @@ def create_app(data_root=None, client_factory=None):
         page = min(page, max(1, (len(rows) + 29) // 30))
         return {'dataset': {'key': key, 'source': manifest['source'], 'labels': manifest['labels'], 'dataset_id': manifest['dataset_id']},
                 'groups': list(groups.values()), 'conversation': active, 'metrics': metrics, 'runs': runs, 'rows': rows[(page - 1) * 30:page * 30], 'total': len(rows), 'page': page,
-                'run': {k: run.get(k) for k in ['run_id', 'prompt_version', 'status', 'mode', 'model', 'started_at']} if run else None,
+                'run': {k: run.get(k) for k in ['run_id', 'prompt_version', 'status', 'mode', 'model', 'started_at', 'retry_limit', 'current_attempt']} if run else None,
                 'counts': {'samples': len(selected), 'conversations': len({s['conversation_id'] for s in selected}),
                            'reviewed': sum(current_refs[s['sample_id']].get('review_status') in {'confirmed', 'adjudicated'} and len(set(current_refs[s['sample_id']].get('reviewers', []))) >= 1 for s in selected)}}
 
