@@ -67,6 +67,8 @@ async def predict_node(sample, labels, prompt, client, mode, analysis=None):
                           length_pass=80 <= len(raw.strip()) <= 180)
     except Exception as exc:
         result['error'] = '节点调用或结构/引用校验失败：' + type(exc).__name__
+        if type(exc) is ValueError and str(exc) in {'情绪缺少买家证据', '情绪引用了非买家消息', '摘要引用不存在或在当前截点不可见', '标签不在客服枚举中', '模型没有返回 JSON'}:
+            result['error'] += '（' + str(exc) + '）'
     result['raw_output'] = ''.join(chunks)
     result['elapsed_ms'] = round((perf_counter() - start) * 1000)
     usage = getattr(client, 'metrics', {}).get('usage') or {}

@@ -8,6 +8,9 @@ from pathlib import Path
 from time import perf_counter
 from uuid import uuid4
 
+RETRY_LIMIT = 5  # Additional attempts, after the initial call.
+RETRY_DELAYS = (1, 2, 4, 8, 8)
+
 POLICY_VERSION = 'label-policy-20261012-v2'
 LABEL_POLICY = ('官方数据：价保资格、补差申请归订单服务；进入退款或打款办理、到账进度时归退款打款。'
                 '买家仅发缺失图片时，情绪延续上一条可见买家消息；无可见前文则无法判断。'
@@ -171,6 +174,21 @@ class Runs:
     def active(self):
         return any(not t.done() for t in self.tasks.values())
 
+    def resume(self, original_id, original, samples, settings):
+        data = deepcopy(original)
+        data['predictions'] = [p for p in data['predictions'] if p.get('status') == 'ok']
+        successful = {p['sample_id'] for p in data['predictions']}
+        pending = [s for s in samples if s['sample_id'] not in successful]
+        if not pending:
+            raise ValueError('没有待重试样本')
+        rid = uuid4().hex
+        data.update(status='running', started_at=now(), resumed_from=original_id,
+                    reused_predictions=len(successful), run_id=original['run_id'] + ' · 断点重试')
+        data.pop('finished_at', None)
+        atomic_json(self.path(rid), data)
+        self.tasks[rid] = asyncio.create_task(self.execute(rid, data, pending, settings))
+        return rid
+
     def start(self, manifest, samples, refs, settings, prompt, version, prompt_id=None, mode='isolated_classifier', analysis_run=None):
         rid = uuid4().hex
         title = {'analysis': '分析节点', 'reply': '回复节点', 'isolated_classifier': '旧独立评测器'}[mode]
@@ -188,20 +206,44 @@ class Runs:
 
     async def execute(self, rid, data, samples, settings):
         from app.copilot.transport import ServiceAiClient
+        data['retry_limit'] = RETRY_LIMIT
         try:
             for sample in samples:
                 if rid in self.stops:
                     break
-                client = self.client_factory(settings) if self.client_factory else ServiceAiClient(settings)
-                if data.get('mode', 'isolated_classifier') == 'isolated_classifier':
-                    prediction = await predict(sample, data['labels'], data['prompt'], client)
-                else:
-                    from evaluation.nodes import predict_node
-                    source = (data.get('analysis_run') or {}).get('analyses', {}).get(sample['sample_id'])
-                    prediction = await predict_node(sample, data['labels'], data['prompt'], client, data['mode'], source)
-                data['predictions'].append(prediction)
-                atomic_json(self.path(rid), data)
-                # Fail fast; do not keep charging after a bad provider/config response.
+                attempts = []
+                started = perf_counter()
+                for index in range(RETRY_LIMIT + 1):
+                    if rid in self.stops:
+                        break
+                    data['current_attempt'] = {'sample_id': sample['sample_id'], 'retry': index,
+                                               'phase': 'calling', 'last_error': attempts[-1].get('error') if attempts else None}
+                    atomic_json(self.path(rid), data)
+                    client = self.client_factory(settings) if self.client_factory else ServiceAiClient(settings)
+                    if data.get('mode', 'isolated_classifier') == 'isolated_classifier':
+                        prediction = await predict(sample, data['labels'], data['prompt'], client)
+                    else:
+                        from evaluation.nodes import predict_node
+                        source = (data.get('analysis_run') or {}).get('analyses', {}).get(sample['sample_id'])
+                        prediction = await predict_node(sample, data['labels'], data['prompt'], client, data['mode'], source)
+                    attempts.append(deepcopy(prediction))
+                    prediction.update(attempt_count=len(attempts), attempts=deepcopy(attempts),
+                                      elapsed_ms=round((perf_counter() - started) * 1000))
+                    tokens = [a['total_tokens'] for a in attempts if type(a.get('total_tokens')) is int]
+                    if tokens:
+                        prediction['total_tokens'] = sum(tokens)
+                    if index == 0:
+                        data['predictions'].append(prediction)
+                    else:
+                        data['predictions'][-1] = prediction
+                    atomic_json(self.path(rid), data)
+                    if prediction['status'] == 'ok' or index == RETRY_LIMIT or rid in self.stops:
+                        break
+                    data['current_attempt'].update(phase='waiting', last_error=prediction.get('error'), next_retry=index + 1)
+                    atomic_json(self.path(rid), data)
+                    await self.retry_wait(rid, RETRY_DELAYS[index])
+                if rid in self.stops:
+                    break
                 if data['predictions'][-1]['status'] != 'ok':
                     data['status'] = 'failed'
                     break
@@ -212,6 +254,15 @@ class Runs:
         except Exception:
             data['status'] = 'failed'
         finally:
+            data.pop('current_attempt', None)
             data['finished_at'] = now()
             atomic_json(self.path(rid), data)
             self.stops.discard(rid)
+
+    async def retry_wait(self, rid, seconds):
+        # Short waits keep the stop button responsive during backoff.
+        remaining = seconds
+        while remaining > 0 and rid not in self.stops:
+            step = min(.25, remaining)
+            await asyncio.sleep(step)
+            remaining -= step

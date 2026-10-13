@@ -199,7 +199,7 @@ def create_app(data_root=None, client_factory=None):
         page = min(page, max(1, (len(rows) + 29) // 30))
         return {'dataset': {'key': key, 'source': manifest['source'], 'labels': manifest['labels'], 'dataset_id': manifest['dataset_id']},
                 'groups': list(groups.values()), 'conversation': active, 'metrics': metrics, 'runs': runs, 'rows': rows[(page - 1) * 30:page * 30], 'total': len(rows), 'page': page,
-                'run': {k: run.get(k) for k in ['run_id', 'prompt_version', 'status', 'mode', 'model', 'started_at']} if run else None,
+                'run': {k: run.get(k) for k in ['run_id', 'prompt_version', 'status', 'mode', 'model', 'started_at', 'retry_limit', 'current_attempt']} if run else None,
                 'counts': {'samples': len(selected), 'conversations': len({s['conversation_id'] for s in selected}),
                            'reviewed': sum(current_refs[s['sample_id']].get('review_status') in {'confirmed', 'adjudicated'} and len(set(current_refs[s['sample_id']].get('reviewers', []))) >= 1 for s in selected)}}
 
@@ -409,6 +409,61 @@ def create_app(data_root=None, client_factory=None):
             raise HTTPException(409, '该任务未在当前进程运行')
         runner.stops.add(run_id)
         return {'status': 'stopping', 'note': '当前请求结束后停止，不再发起下一次调用'}
+
+    def resume_plan(key, rid, split):
+        import hashlib
+        from app.core.config import get_settings
+        from urllib.parse import urlsplit
+        manifest, samples, _ = bundle(key)
+        run = get_run(rid, manifest, split)
+        settings = get_settings()
+        if run.get('status') not in {'failed', 'cancelled', 'interrupted'} or run.get('mode') not in {'analysis', 'reply', 'isolated_classifier'}:
+            raise HTTPException(422, '只有失败、已停止或中断的在线运行可以断点重试')
+        if settings.ai_provider != 'openai' or urlsplit(settings.openai_base_url).hostname != 'ws-k0ry66e5zn5pf7wy.cn-beijing.maas.aliyuncs.com':
+            raise HTTPException(403, '模型目的地已变化，不能沿用旧运行重试')
+        for field, value in [('provider', settings.ai_provider), ('model', settings.openai_model), ('temperature', settings.ai_temperature), ('max_tokens', settings.ai_max_tokens)]:
+            if run.get(field) != value:
+                raise HTTPException(409, '模型参数已变化，请恢复原配置或新建评测，不能混入原运行')
+        if not run.get('prompt') or hashlib.sha256(run['prompt'].encode()).hexdigest() != run.get('prompt_sha256'):
+            raise HTTPException(422, '原运行 Prompt 快照缺失或校验失败')
+        ids = run.get('sample_ids', [])
+        selected = [s for s in samples if s['sample_id'] in ids and s['split'] == split]
+        if not ids or len(selected) != len(ids):
+            raise HTTPException(422, '原运行的样本范围不完整')
+        success = {p['sample_id'] for p in run['predictions'] if p.get('status') == 'ok'}
+        pending = [s for s in selected if s['sample_id'] not in success]
+        if not pending:
+            raise HTTPException(422, '所有样本已成功，无需重试')
+        prepared_inputs(pending, manifest, run['mode'], run['prompt'], run.get('analysis_run'))
+        token = hashlib.sha256(json.dumps(run, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        failures = [p for p in run['predictions'] if p.get('status') != 'ok']
+        info = {'token': token, 'reused': len(success), 'pending': len(pending), 'total': len(selected),
+                'prompt_version': run['prompt_version'], 'model': run['model'],
+                'last_error': failures[-1].get('error', '') if failures else '',
+                'failed_sample': failures[-1]['sample_id'] if failures else ''}
+        return run, selected, settings, info
+
+    @app.get('/api/resume/{key}')
+    def preview_resume(key: str, run_id: str, split: str = 'dev'):
+        return resume_plan(key, run_id, split)[3]
+
+    @app.post('/api/resume/{key}')
+    async def resume(key: str, request: Request):
+        data = await request.json()
+        if runner.active():
+            raise HTTPException(409, '已有评测正在运行，请等待或停止')
+        original_id = data.get('run_id', '')
+        run, samples, settings, info = resume_plan(key, original_id, data.get('split', 'dev'))
+        if data.get('token') != info['token']:
+            raise HTTPException(409, '运行记录已变化，请重新预览断点重试')
+        rid = runner.resume(original_id, run, samples, settings)
+        if run['mode'] == 'reply':
+            from evaluation.workflow import atomic_json
+            success = {p['sample_id'] for p in run['predictions'] if p.get('status') == 'ok'}
+            ratings = {sid: r for sid, r in read_ratings(original_id).items() if sid in success}
+            if ratings:
+                atomic_json(root / 'reply-reviews' / (rid + '.json'), ratings)
+        return {'id': rid, **info}
 
     @app.post('/api/rescore/{key}')
     async def rescore(key: str, request: Request):

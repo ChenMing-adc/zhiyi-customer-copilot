@@ -94,8 +94,11 @@ let polling=false;
 setInterval(async()=>{
  const run=state?.run;
  $('run-stop').disabled=demo||run?.status!=='running';
+ $('run-resume').disabled=demo||!['failed','cancelled','interrupted'].includes(run?.status);
  $('rescore').disabled=demo||!run||run.status==='running'||run.mode==='reply';
  $('run-progress').textContent=demo?'人工示例，不调用模型':run?.status?`运行状态：${({running:'运行中',completed:'已完成',failed:'失败，已停止后续调用',cancelled:'已停止',interrupted:'服务重启中断'})[run.status]||run.status} · ${state.metrics.received_predictions}/${state.counts.samples} · ${run.model||''} · ${run.prompt_version}`:'未选择在线评测任务';
+ const attempt=run?.current_attempt;
+ if(attempt){$('run-progress').textContent+=` · ${attempt.sample_id} · ${attempt.phase==='waiting'?'等待自动重试 '+attempt.next_retry:'调用中：'+(attempt.retry?'自动重试 '+attempt.retry:'首次调用')}${attempt.retry||attempt.phase==='waiting'?' / '+(run.retry_limit??5):''}${attempt.last_error?' · '+attempt.last_error:''}`;}
  if(!demo&&run?.status==='running'&&!polling){polling=true;try{const sid=selected;await load();if(sid)await showSample(sid);}finally{polling=false;}}
 },2500);
 
@@ -173,7 +176,7 @@ async function changeNode(){
  const mode=$('eval-mode').value;
  $('analysis-source-field').hidden=mode!=='reply';
  $('prompt-heading').textContent=nodeNames[mode];
- $('node-help').textContent=mode==='reply'?'先选一条分析运行记录，再勾选该记录已成功分析的截点。每个截点仅调用回复节点一次，固定分析结果随运行保存。':'每个截点调用一次模型。新数据集只标注情绪和意图；产品风险由规则生成，不是分析 Prompt 的分类输出。';
+ $('node-help').textContent=mode==='reply'?'先选一条分析运行记录，再勾选该记录已成功分析的截点。仅调用回复节点；失败后最多重试 5 次，固定分析结果随运行保存。':'每个截点首次调用一次，失败后最多重试 5 次。新数据集只标注情绪和意图；产品风险由规则生成，不是分析 Prompt 的分类输出。';
  $('prompt-contract').textContent=mode==='analysis'?'输入：截点前可见聊天与事实。输出：intent、emotion、trend、emotion_evidence、summary、missing_info、next_action；复用产品结构和引用校验，情绪/意图按数据集标签计分。':mode==='reply'?'输入：固定分析结果＋同一截点上下文。输出：回复正文；展示产品校验通过率、长度符合率和四项人工质量评分。校验通过不等于回复质量合格。':'历史独立分类与草稿评测，不对应产品节点，仅用于旧结果对照。';
  const old=$('analysis-source').value;
  const runs=(state?.runs||[]).filter(r=>r.mode==='analysis');
@@ -190,3 +193,20 @@ async function reloadBatchCatalog(){
  const d=await api(`/api/baseline/catalog/${encodeURIComponent(baselineKey)}?${new URLSearchParams(selection)}`);if(ticket!==catalogEpoch)return;
  batchCatalog=d.groups;const allowed=new Set(batchCatalog.flatMap(g=>g.samples.map(s=>s.id)));batchSelected=new Set([...batchSelected].filter(id=>allowed.has(id)));batchActive=activeConversation;renderBatch();
 }
+
+let resumeSelection=null;
+$('resume-close').onclick=()=>$('resume-dialog').close();
+$('run-resume').onclick=async()=>{
+ try{const key=$('dataset').value,run_id=$('run').value,split=$('split').value;
+ const d=await api(`/api/resume/${encodeURIComponent(key)}?${new URLSearchParams({run_id,split})}`);
+ resumeSelection={key,run_id,split,token:d.token};
+ $('resume-summary').textContent=`共 ${d.total} 条，保留成功 ${d.reused} 条，补跑 ${d.pending} 条。版本 ${d.prompt_version} · ${d.model}。${d.last_error?'最近失败：'+d.failed_sample+' · '+d.last_error:''}`;
+ $('resume-status').textContent='';$('resume-start').textContent=`补跑 ${d.pending} 条`;$('resume-dialog').showModal();
+ }catch(e){notice(e.message);}
+};
+$('resume-start').onclick=async()=>{
+ $('resume-start').disabled=true;
+ try{const d=await post(`/api/resume/${encodeURIComponent(resumeSelection.key)}`,resumeSelection);
+ $('resume-dialog').close();$('run').innerHTML=`<option value="${d.id}">断点重试</option>`;await load();notice(`已复用 ${d.reused} 条成功结果，补跑 ${d.pending} 条。原失败记录保留。`);
+ }catch(e){$('resume-status').textContent=e.message;}finally{$('resume-start').disabled=false;}
+};

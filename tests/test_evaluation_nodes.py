@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 
 from fastapi.testclient import TestClient
 from app.copilot.analysis import analysis_prompt, reply_prompt, situation_messages, reply_messages, Situation
@@ -119,6 +119,40 @@ class NodeTests(unittest.TestCase):
         result = asyncio.run(predict_node(self.samples[0], CSDS_LABELS, builtin_prompts()[0]['prompt'], Client(), 'analysis'))
         self.assertEqual(result['status'], 'error')
         self.assertNotIn('analysis', result)
+
+    def test_resume_reuses_success_and_preserves_failed_run(self):
+        calls = []
+        good = self.situation
+        class Client:
+            async def stream(self, messages):
+                calls.append(messages)
+                yield json.dumps({**good, 'emotion_evidence': []} if 2 <= len(calls) <= 7 else good)
+        with patch('evaluation.workflow.Runs.retry_wait', new_callable=AsyncMock), patch('app.core.config.get_settings', return_value=self.settings), TestClient(create_app(self.root, lambda _: Client())) as c:
+            selection = dict(mode='analysis', split='dev', prompt_id='builtin:situation-v1')
+            preview = c.post('/api/baseline/preview/fixture', json=selection).json()
+            rid = c.post('/api/baseline/fixture', json={**selection, 'selection_hash': preview['selection_hash']}).json()['id']
+            original_path = self.root / 'ui-runs' / (rid + '.json')
+            before = original_path.read_bytes()
+            original = json.loads(before)
+            self.assertEqual(original['status'], 'failed')
+            self.assertIn('情绪缺少买家证据', original['predictions'][1]['error'])
+            plan = c.get('/api/resume/fixture', params={'run_id': rid}).json()
+            self.assertEqual((plan['reused'], plan['pending']), (1, 1))
+            self.assertEqual(c.post('/api/resume/fixture', json={'run_id': rid, 'token': 'stale'}).status_code, 409)
+            self.settings.ai_max_tokens = 513
+            self.assertEqual(c.get('/api/resume/fixture', params={'run_id': rid}).status_code, 409)
+            self.settings.ai_max_tokens = 512
+            resumed = c.post('/api/resume/fixture', json={'run_id': rid, 'token': plan['token']}).json()['id']
+            saved = json.loads((self.root / 'ui-runs' / (resumed + '.json')).read_text(encoding='utf-8'))
+            self.assertEqual(len(calls), 8)
+            self.assertEqual(saved['status'], 'completed')
+            self.assertEqual(saved['resumed_from'], rid)
+            self.assertEqual(saved['references'], original['references'])
+            self.assertEqual(saved['prompt'], original['prompt'])
+            self.assertEqual(saved['predictions'][0], original['predictions'][0])
+            self.assertEqual(len({p['sample_id'] for p in saved['predictions']}), 2)
+            self.assertEqual(original_path.read_bytes(), before)
+            self.assertEqual(c.get('/api/resume/fixture', params={'run_id': resumed}).status_code, 422)
 
     def test_refresh_keeps_split_and_changes_identity_without_old_mutation(self):
         src = self.root / 'annotations.json'
